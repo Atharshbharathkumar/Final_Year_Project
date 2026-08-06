@@ -88,7 +88,11 @@ export const Dashboard = () => {
                 <h3 className="text-sm font-bold text-slate-100">{course.title}</h3>
                 <p className="text-xs text-slate-400 line-clamp-2">{course.description}</p>
                 <div className="pt-2 flex items-center justify-between border-t border-slate-800 text-xs">
-                  <span className="text-slate-400 font-medium">Prof. {course.teacher?.fullName?.split(' ')[0]}</span>
+                  {/* No "Prof." prefix: the stored name already carries the title
+                      where there is one, and prefixing produced "Prof. Prof." */}
+                  <span className="text-slate-400 font-medium">
+                    {course.teacher?.fullName || 'Unassigned'}
+                  </span>
                   <Link to={`/classroom/${course.id}`} className="font-bold text-indigo-400 flex items-center gap-1 hover:underline">
                     Join <ArrowRight className="w-3.5 h-3.5" />
                   </Link>

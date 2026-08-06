@@ -81,10 +81,12 @@ export const Sidebar = () => {
               className="flex items-center justify-between p-3 rounded-xl bg-indigo-950/40 border border-indigo-500/20 hover:border-indigo-500/40 text-xs transition-all group"
             >
               <div className="flex items-center gap-2.5">
-                <div className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                <div className="w-2 h-2 rounded-full bg-indigo-400" />
                 <div>
-                  <span className="font-semibold text-slate-200 block group-hover:text-indigo-300">Live AI Class</span>
-                  <span className="text-[10px] text-slate-400">CS401 • Prof. Turing</span>
+                  {/* Static shortcut to session 1. The course code and teacher
+                      name were hardcoded here and did not track the session. */}
+                  <span className="font-semibold text-slate-200 block group-hover:text-indigo-300">Live Classroom</span>
+                  <span className="text-[10px] text-slate-400">Session 1</span>
                 </div>
               </div>
               <Video className="w-4 h-4 text-indigo-400" />
@@ -97,8 +99,8 @@ export const Sidebar = () => {
               <div className="flex items-center gap-2.5">
                 <ShieldAlert className="w-4 h-4 text-rose-400" />
                 <div>
-                  <span className="font-semibold text-slate-200 block group-hover:text-rose-300">Proctored Midterm</span>
-                  <span className="text-[10px] text-slate-400">30 Min • Camera Lock</span>
+                  <span className="font-semibold text-slate-200 block group-hover:text-rose-300">Proctored Exam</span>
+                  <span className="text-[10px] text-slate-400">Exam 1</span>
                 </div>
               </div>
               <FileCheck className="w-4 h-4 text-rose-400" />

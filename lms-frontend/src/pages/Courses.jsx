@@ -98,8 +98,10 @@ export const Courses = () => {
             </div>
 
             <div className="p-5 pt-3 border-t border-slate-800 flex items-center justify-between">
+              {/* Name rendered as stored. The old fallback invented a teacher
+                  called "Turing" for any course with none assigned. */}
               <span className="text-xs text-slate-400 font-medium">
-                Prof. {course.teacher?.fullName || 'Turing'}
+                {course.teacher?.fullName || 'Unassigned'}
               </span>
 
               <div className="flex items-center gap-2">
