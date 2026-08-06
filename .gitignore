@@ -1,0 +1,41 @@
+# --- Dependencies and build output ---
+node_modules/
+dist/
+build/
+target/
+*.class
+
+# --- Face detection model weights ---
+# ~870 KB of binary weights fetched by lms-frontend/scripts/fetch-face-models.ps1.
+# Kept out of git so the repo stays source-only; the script re-downloads them.
+lms-frontend/public/models/*
+!lms-frontend/public/models/.gitkeep
+
+# --- Runtime artefacts ---
+# Proctoring snapshots are images of real people. They must never be committed.
+uploads/
+*.log
+
+# --- Local configuration ---
+.env
+.env.local
+*.local
+
+# --- IDE ---
+.idea/
+*.iml
+*.iws
+.classpath
+.project
+.settings/
+
+# --- OS ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# --- Office temp files ---
+~$*.pptx
+~$*.docx
+~$*.xlsx
