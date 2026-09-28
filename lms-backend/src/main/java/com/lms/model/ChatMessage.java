@@ -32,6 +32,6 @@ public class ChatMessage {
 
     @PrePersist
     protected void onCreate() {
-        timestamp = LocalDateTime.now();
+        if (timestamp == null) timestamp = LocalDateTime.now();
     }
 }

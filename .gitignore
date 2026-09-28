@@ -5,11 +5,19 @@ build/
 target/
 *.class
 
-# --- Face detection model weights ---
-# ~870 KB of binary weights fetched by lms-frontend/scripts/fetch-face-models.ps1.
-# Kept out of git so the repo stays source-only; the script re-downloads them.
-lms-frontend/public/models/*
-!lms-frontend/public/models/.gitkeep
+# --- Vendored third-party source ---
+# A full copy of Google's MediaPipe source tree (~84 MB, 4700+ files). The app
+# never builds from it: it uses the @mediapipe/tasks-vision npm package plus the
+# prebuilt model and WASM runtime in lms-frontend/public/.
+mediapipe-master/
+
+# --- Local database ---
+# File-backed H2 lives here and is rebuilt by DataInitializer on first start.
+# Never commit it: it also carries the seeded demo accounts.
+lms-backend/data/
+*.mv.db
+*.trace.db
+*.lock.db
 
 # --- Runtime artefacts ---
 # Proctoring snapshots are images of real people. They must never be committed.
@@ -39,3 +47,10 @@ Desktop.ini
 ~$*.pptx
 ~$*.docx
 ~$*.xlsx
+
+# NOTE: lms-frontend/public/models/ and lms-frontend/public/mediapipe/ ARE
+# tracked deliberately (~27 MB). The face_landmarker.task model and the WASM
+# runtime are served from the app's own origin so the vision pipeline works with
+# no internet connection and no third-party CDN. The earlier fetch-face-models
+# script that justified excluding them no longer exists, so excluding them would
+# leave a fresh clone unable to run the proctoring pipeline at all.

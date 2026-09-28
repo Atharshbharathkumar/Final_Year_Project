@@ -78,6 +78,20 @@ public class AuthService {
                 .fullName(user.getFullName())
                 .role(user.getRole())
                 .avatarUrl(user.getAvatarUrl())
+                .avatarEmoji(user.getAvatarEmoji() != null ? user.getAvatarEmoji() : defaultEmoji(user.getRole()))
+                .department(user.getDepartment() != null ? user.getDepartment().getCode() : null)
+                .studyYear(user.getStudyYear())
+                .linkedStudentId(user.getLinkedStudent() != null ? user.getLinkedStudent().getId() : null)
+                .linkedStudentName(user.getLinkedStudent() != null ? user.getLinkedStudent().getFullName() : null)
                 .build();
+    }
+
+    private String defaultEmoji(User.Role role) {
+        return switch (role) {
+            case STUDENT -> "🎓";
+            case TEACHER -> "👩‍🏫";
+            case PARENT -> "👨‍👦";
+            case ADMIN -> "⚙️";
+        };
     }
 }

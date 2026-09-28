@@ -33,11 +33,25 @@ public class Alert {
     private String message;
     private String snapshotPath;
 
+    /**
+     * Set when a teacher forgives this alert — readmitting a removed student,
+     * for instance. Resolved alerts stop counting towards enforcement but stay
+     * on the record, so the audit trail is never rewritten.
+     */
+    private Boolean resolved;
+
+    private LocalDateTime resolvedAt;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "resolved_by_id")
+    private User resolvedBy;
+
     private LocalDateTime timestamp;
 
     @PrePersist
     protected void onCreate() {
         if (timestamp == null) timestamp = LocalDateTime.now();
+        if (resolved == null) resolved = false;
     }
 
     public enum AlertType {
@@ -45,7 +59,11 @@ public class Alert {
         MULTIPLE_FACES,
         LOOKING_AWAY,
         TAB_SWITCH,
-        LOW_ATTENTION
+        LOW_ATTENTION,
+        /** The student left the class window for another application. */
+        OFF_TASK,
+        /** The student stopped sharing their screen mid-session. */
+        SCREEN_SHARE_STOPPED
     }
 
     public enum Severity {

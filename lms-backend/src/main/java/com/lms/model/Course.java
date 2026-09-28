@@ -32,10 +32,23 @@ public class Course {
 
     private String coverImage;
 
+    /** Accent colour the course cards render with, e.g. "#6366f1". */
+    private String color;
+
+    /** Emoji tile shown next to the course name. */
+    private String icon;
+
+    private Integer creditHours;
+
+    private String semester;
+
+    /** Number of teaching sessions in the syllabus, used for progress %. */
+    private Integer totalSessions;
+
     private LocalDateTime createdAt;
 
     @PrePersist
     protected void onCreate() {
-        createdAt = LocalDateTime.now();
+        if (createdAt == null) createdAt = LocalDateTime.now();
     }
 }

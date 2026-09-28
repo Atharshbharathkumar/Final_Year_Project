@@ -21,13 +21,8 @@ public class User {
     @Column(unique = true, nullable = false)
     private String email;
 
-    /**
-     * Never serialised. Several endpoints return entities that embed a User
-     * (submissions, achievements, attendance, attention logs), and without this
-     * every one of them would put the BCrypt hash in the response body.
-     */
-    @JsonIgnore
     @Column(nullable = false)
+    @JsonIgnore
     private String password;
 
     @Column(nullable = false)
@@ -39,11 +34,32 @@ public class User {
 
     private String avatarUrl;
 
+    /** Emoji avatar rendered by the UI roster//navbar. */
+    private String avatarEmoji;
+
+    @ManyToOne(fetch = FetchType.EAGER)
+    @JoinColumn(name = "department_id")
+    private Department department;
+
+    /** Academic year of study, students only. */
+    private Integer studyYear;
+
+    /** Latest computed GPA (0.0 - 4.0), refreshed from graded work. */
+    private Double gpa;
+
+    /**
+     * For PARENT accounts: the student this guardian is allowed to observe.
+     */
+    @ManyToOne(fetch = FetchType.EAGER)
+    @JoinColumn(name = "linked_student_id")
+    @JsonIgnore
+    private User linkedStudent;
+
     private LocalDateTime createdAt;
 
     @PrePersist
     protected void onCreate() {
-        createdAt = LocalDateTime.now();
+        if (createdAt == null) createdAt = LocalDateTime.now();
     }
 
     public enum Role {

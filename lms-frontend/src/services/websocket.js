@@ -1,133 +1,143 @@
 import { Client } from '@stomp/stompjs';
 import SockJS from 'sockjs-client';
-import { SERVER_ORIGIN } from './api';
+
+const WS_URL = import.meta.env.VITE_WS_URL || 'http://localhost:8080/ws';
 
 /**
- * STOMP connection shared by the whole app.
+ * Single shared STOMP connection.
  *
- * Several features listen to the same topic — chat and WebRTC signalling both
- * use /topic/classroom/{id} — so a topic keeps a SET of handlers and holds one
- * STOMP subscription for all of them. Subscribing used to replace the previous
- * handler for a topic, which silently broke whichever feature subscribed first.
+ * Subscriptions are requested by topic and replayed once the socket is up, so
+ * callers never have to care whether the connection has finished handshaking.
+ * Every teardown path is defensive: React unmounts (and StrictMode's double
+ * effect invocation in development) routinely try to unsubscribe from a socket
+ * that is already gone, and stompjs throws if you let that reach it.
  */
 class WebSocketService {
   constructor() {
     this.client = null;
+    this.subscriptions = new Map(); // topic -> StompSubscription
+    this.handlers = new Map();      // topic -> callback, kept for replay
     this.connected = false;
-    /** @type {Map<string, {sub: any, handlers: Set<Function>}>} */
-    this.topics = new Map();
-    /** One-shot callbacks waiting for the socket to come up. */
-    this.pendingOnConnect = [];
   }
 
-  connect(onConnectedCallback) {
+  connect(onConnected) {
     if (this.connected) {
-      onConnectedCallback?.();
+      if (onConnected) onConnected();
       return;
     }
 
-    // Queue rather than attach to the client, so a caller that arrives after
-    // activation still runs. Dropping these silently would mean, for example,
-    // a WebRTC PEER_JOIN never being announced.
-    if (onConnectedCallback) this.pendingOnConnect.push(onConnectedCallback);
-
-    if (!this.client) {
-      this.client = new Client({
-        webSocketFactory: () => new SockJS(`${SERVER_ORIGIN}/ws`),
-        reconnectDelay: 3000,
-        heartbeatIncoming: 4000,
-        heartbeatOutgoing: 4000,
-        onConnect: () => {
-          this.connected = true;
-          // Re-establish every topic that has live handlers. Without this a
-          // reconnect would leave the app subscribed to nothing.
-          this.topics.forEach((entry, topic) => this._openSubscription(topic, entry));
-
-          const queued = this.pendingOnConnect;
-          this.pendingOnConnect = [];
-          queued.forEach((cb) => {
-            try { cb(); } catch (err) { console.error('[WebSocket] onConnect handler failed', err); }
-          });
-        },
-        onWebSocketClose: () => {
-          this.connected = false;
-          this.topics.forEach((entry) => { entry.sub = null; });
-        },
-        onStompError: (frame) => {
-          console.error('[WebSocket] STOMP error:', frame.headers['message']);
-        },
-      });
-      this.client.activate();
+    if (this.client) {
+      // A connection attempt is already in flight — queue the callback.
+      if (onConnected) this.pending = [...(this.pending || []), onConnected];
+      return;
     }
-  }
 
-  _openSubscription(topic, entry) {
-    if (entry.sub || !this.connected) return;
-    entry.sub = this.client.subscribe(topic, (message) => {
-      let payload;
-      try {
-        payload = JSON.parse(message.body);
-      } catch {
-        payload = message.body;
-      }
-      // Copy before iterating: a handler may unsubscribe itself.
-      Array.from(entry.handlers).forEach((handler) => {
-        try {
-          handler(payload);
-        } catch (err) {
-          console.error(`[WebSocket] handler failed for ${topic}`, err);
-        }
-      });
+    this.pending = onConnected ? [onConnected] : [];
+
+    this.client = new Client({
+      webSocketFactory: () => new SockJS(WS_URL),
+      reconnectDelay: 5000,
+      heartbeatIncoming: 10000,
+      heartbeatOutgoing: 10000,
+      onConnect: () => {
+        this.connected = true;
+        // Re-attach every topic we were asked to watch.
+        this.handlers.forEach((callback, topic) => this._attach(topic, callback));
+        const queued = this.pending || [];
+        this.pending = [];
+        queued.forEach(cb => {
+          try { cb(); } catch { /* a subscriber callback must not kill the socket */ }
+        });
+      },
+      onDisconnect: () => {
+        this.connected = false;
+        this.subscriptions.clear();
+      },
+      onWebSocketClose: () => {
+        this.connected = false;
+        this.subscriptions.clear();
+      },
+      onStompError: (frame) => {
+        console.error('[WebSocket] STOMP error:', frame?.headers?.message);
+      },
     });
+
+    this.client.activate();
   }
 
   /**
-   * @returns {Function} call to remove just this handler
+   * Watch a topic. Safe to call before the socket is open — the subscription is
+   * recorded and attached on connect.
    */
   subscribe(topic, callback) {
-    let entry = this.topics.get(topic);
-    if (!entry) {
-      entry = { sub: null, handlers: new Set() };
-      this.topics.set(topic, entry);
-    }
-    entry.handlers.add(callback);
+    this.handlers.set(topic, callback);
 
-    if (this.connected) {
-      this._openSubscription(topic, entry);
-    } else {
+    if (!this.client) {
       this.connect();
+      return;
     }
-
-    return () => this.unsubscribe(topic, callback);
+    if (this.connected) this._attach(topic, callback);
   }
 
-  /** Omitting `callback` removes every handler for the topic. */
-  unsubscribe(topic, callback) {
-    const entry = this.topics.get(topic);
-    if (!entry) return;
+  _attach(topic, callback) {
+    if (!this.client || !this.connected) return;
+    if (this.subscriptions.has(topic)) return;
 
-    if (callback) entry.handlers.delete(callback);
-    else entry.handlers.clear();
+    try {
+      const sub = this.client.subscribe(topic, (message) => {
+        let payload = message.body;
+        try {
+          payload = JSON.parse(message.body);
+        } catch {
+          /* server sent a plain string */
+        }
+        try {
+          callback(payload);
+        } catch (err) {
+          console.error('[WebSocket] handler threw for', topic, err);
+        }
+      });
+      this.subscriptions.set(topic, sub);
+    } catch (err) {
+      console.warn('[WebSocket] could not subscribe to', topic, err?.message);
+    }
+  }
 
-    if (entry.handlers.size === 0) {
-      entry.sub?.unsubscribe();
-      this.topics.delete(topic);
+  unsubscribe(topic) {
+    this.handlers.delete(topic);
+
+    const sub = this.subscriptions.get(topic);
+    this.subscriptions.delete(topic);
+    if (!sub) return;
+
+    // The socket may already be closed — stompjs throws in that case, and this
+    // runs inside React cleanup where a throw would unmount the whole tree.
+    try {
+      if (this.connected) sub.unsubscribe();
+    } catch {
+      /* connection already gone; nothing to release */
     }
   }
 
   send(destination, payload) {
-    if (this.client && this.connected) {
+    if (!this.client || !this.connected) return false;
+    try {
       this.client.publish({ destination, body: JSON.stringify(payload) });
       return true;
+    } catch (err) {
+      console.warn('[WebSocket] publish failed:', err?.message);
+      return false;
     }
-    return false;
   }
 
   disconnect() {
-    this.pendingOnConnect = [];
-    this.topics.forEach((entry) => entry.sub?.unsubscribe());
-    this.topics.clear();
-    this.client?.deactivate();
+    if (!this.client) return;
+    this.subscriptions.forEach((sub) => {
+      try { sub.unsubscribe(); } catch { /* already closed */ }
+    });
+    this.subscriptions.clear();
+    this.handlers.clear();
+    try { this.client.deactivate(); } catch { /* already stopping */ }
     this.client = null;
     this.connected = false;
   }

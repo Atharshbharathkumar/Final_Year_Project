@@ -29,6 +29,6 @@ public class Enrollment {
 
     @PrePersist
     protected void onCreate() {
-        enrolledAt = LocalDateTime.now();
+        if (enrolledAt == null) enrolledAt = LocalDateTime.now();
     }
 }

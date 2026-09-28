@@ -1,5 +1,6 @@
 package com.lms.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import lombok.*;
 
@@ -20,26 +21,31 @@ public class Assignment {
     @Column(nullable = false)
     private String title;
 
-    @Column(length = 4000)
+    @Column(length = 2000)
     private String description;
 
     @ManyToOne(fetch = FetchType.EAGER)
     @JoinColumn(name = "course_id", nullable = false)
+    @JsonIgnore
     private Course course;
-
-    @ManyToOne(fetch = FetchType.EAGER)
-    @JoinColumn(name = "created_by_id")
-    private User createdBy;
 
     private LocalDateTime dueDate;
 
-    private Integer maxMarks;
+    private Integer points;
+
+    @Enumerated(EnumType.STRING)
+    private Priority priority;
 
     private LocalDateTime createdAt;
 
     @PrePersist
     protected void onCreate() {
-        createdAt = LocalDateTime.now();
-        if (maxMarks == null) maxMarks = 100;
+        if (createdAt == null) createdAt = LocalDateTime.now();
+    }
+
+    public enum Priority {
+        LOW,
+        MEDIUM,
+        HIGH
     }
 }

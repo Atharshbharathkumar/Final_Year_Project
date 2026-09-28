@@ -1,418 +1,306 @@
-import * as faceapi from 'face-api.js';
-
-let modelsLoaded = false;
-let frameBuffer = [];
-const BUFFER_SIZE = 10;
+import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+import {
+  LEFT_EYE_EAR, RIGHT_EYE_EAR, THRESHOLDS,
+  computeEAR, eulerFromMatrix, blendshape, gazeDeviation, dominantExpression,
+  classifyEyeStatus, computeAttentionScore, createSmoother, landmarkBounds, buildReading,
+} from './faceScoring';
 
 /**
- * Single source of truth for which detection path is live.
- *   CNN      - face-api.js neural nets loaded, real landmark detection running
- *   DEGRADED - weights missing/unloadable, brightness+skin-tone heuristic only
- *   LOADING  - load not yet attempted or still in flight
- * Anything reading detection output must branch on this. A silent fallback
- * between the two paths is what made the earlier telemetry meaningless.
+ * Proctoring vision pipeline, built on MediaPipe FaceLandmarker.
+ *
+ * The model produces 478 3D landmarks, 52 blendshapes and a facial
+ * transformation matrix per face. Head pose comes from that matrix rather than
+ * from a hand-rolled approximation, and eye state comes from the blendshapes
+ * cross-checked against a geometric eye aspect ratio.
+ *
+ * Everything runs in the browser. Frames never leave the device — only the
+ * derived numbers in {@link buildReading} are sent anywhere.
+ *
+ * The WASM runtime and the model are served from `public/`, so this works with
+ * no internet connection at demo time.
  */
-const engineState = { mode: 'LOADING', reason: null };
-export const getEngineState = () => ({ ...engineState });
 
+const WASM_PATH = '/mediapipe/wasm';
+const MODEL_PATH = '/models/face_landmarker.task';
+
+let landmarker = null;
 let loadPromise = null;
+let lastVideoTime = -1;
+let lastResult = null;
 
+const smoother = createSmoother(0.35, 10);
+
+/** Why the pipeline is unavailable, surfaced to the UI instead of a silent fallback. */
+export let loadError = null;
+
+export const isModelLoaded = () => landmarker !== null;
+
+/**
+ * Loads the WASM runtime and the landmark model. Safe to call repeatedly — the
+ * work happens once and subsequent callers await the same promise.
+ */
 export const loadFaceModels = async () => {
-  if (modelsLoaded) return getEngineState();
+  if (landmarker) return true;
   if (loadPromise) return loadPromise;
 
   loadPromise = (async () => {
     try {
-      const MODEL_URL = '/models';
-      // ageGenderNet was loaded here previously but nothing ever read its output.
-      await Promise.all([
-        faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
-        faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
-        faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL),
-      ]);
-      modelsLoaded = true;
-      engineState.mode = 'CNN';
-      engineState.reason = null;
-    } catch (err) {
-      modelsLoaded = false;
-      engineState.mode = 'DEGRADED';
-      engineState.reason = `Face model load failed (${err.message}). Landmark, head-pose, expression and multi-face detection are unavailable.`;
-      console.error('[Vision] DEGRADED —', engineState.reason);
+      const fileset = await FilesetResolver.forVisionTasks(WASM_PATH);
+      landmarker = await FaceLandmarker.createFromOptions(fileset, {
+        baseOptions: {
+          modelAssetPath: MODEL_PATH,
+          delegate: 'GPU',
+        },
+        runningMode: 'VIDEO',
+        // Two faces is enough to detect "someone else is in frame" without
+        // paying for a crowd.
+        numFaces: 2,
+        outputFaceBlendshapes: true,
+        outputFacialTransformationMatrixes: true,
+      });
+      loadError = null;
+      console.info('[Proctoring] MediaPipe FaceLandmarker ready');
+      return true;
+    } catch (gpuError) {
+      // Machines without a usable WebGL context still need to work.
+      try {
+        const fileset = await FilesetResolver.forVisionTasks(WASM_PATH);
+        landmarker = await FaceLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: MODEL_PATH, delegate: 'CPU' },
+          runningMode: 'VIDEO',
+          numFaces: 2,
+          outputFaceBlendshapes: true,
+          outputFacialTransformationMatrixes: true,
+        });
+        loadError = null;
+        console.info('[Proctoring] MediaPipe FaceLandmarker ready (CPU)');
+        return true;
+      } catch (cpuError) {
+        loadError = cpuError?.message || gpuError?.message || 'The vision model could not be loaded.';
+        landmarker = null;
+        loadPromise = null;
+        console.error('[Proctoring] model load failed:', loadError);
+        return false;
+      }
     }
-    return getEngineState();
   })();
 
   return loadPromise;
 };
 
-/**
- * Per-frame attention analysis.
- *
- * On the CNN path (engineState.mode === 'CNN') this runs:
- * - Tiny Face Detector CNN for face bounding boxes and face count
- * - 68-point facial landmark CNN
- * - Head orientation approximated from landmark geometry (see estimateHeadPose)
- * - Eye Aspect Ratio (EAR) from the eye landmark polygons
- * - Expression classification via faceExpressionNet
- *
- * On the DEGRADED path none of the above is available; see advancedCanvasFallback.
- * The returned `engine` field says which path produced the result — callers must
- * not present DEGRADED output as measurement.
- */
-export const detectAttention = async (videoElement, canvasElement) => {
-  if (!videoElement || videoElement.readyState < 2) {
-    // Video not ready yet. Report unknown rather than inventing a high score.
-    return buildResult({
-      faceDetected: null,
-      faceCount: null,
-      eyeStatus: 'UNKNOWN',
-      attentionScore: null,
-      engine: 'LOADING',
-    });
-  }
-
-  if (modelsLoaded) {
-    try {
-      const detections = await faceapi
-        .detectAllFaces(videoElement, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.35 }))
-        .withFaceLandmarks()
-        .withFaceExpressions();
-
-      const displaySize = { width: videoElement.videoWidth || 480, height: videoElement.videoHeight || 360 };
-
-      if (canvasElement) {
-        faceapi.matchDimensions(canvasElement, displaySize);
-        const resized = faceapi.resizeResults(detections, displaySize);
-        const ctx = canvasElement.getContext('2d');
-        ctx.clearRect(0, 0, displaySize.width, displaySize.height);
-
-        resized.forEach(det => {
-          const box = det.detection.box;
-          const score = Math.round(det.detection.score * 100);
-
-          // Draw futuristic bounding box
-          ctx.strokeStyle = '#6366f1';
-          ctx.lineWidth = 2;
-          ctx.shadowColor = '#6366f1';
-          ctx.shadowBlur = 12;
-          ctx.strokeRect(box.x, box.y, box.width, box.height);
-          ctx.shadowBlur = 0;
-
-          // Corner brackets
-          const cornerLen = 16;
-          ctx.strokeStyle = '#10b981';
-          ctx.lineWidth = 3;
-          [[box.x, box.y], [box.x + box.width, box.y],
-           [box.x, box.y + box.height], [box.x + box.width, box.y + box.height]].forEach(([cx, cy]) => {
-            const sx = cx === box.x ? 1 : -1;
-            const sy = cy === box.y ? 1 : -1;
-            ctx.beginPath();
-            ctx.moveTo(cx, cy + sy * cornerLen);
-            ctx.lineTo(cx, cy);
-            ctx.lineTo(cx + sx * cornerLen, cy);
-            ctx.stroke();
-          });
-
-          // Score label
-          ctx.fillStyle = 'rgba(11,15,25,0.75)';
-          ctx.fillRect(box.x, box.y - 22, 160, 20);
-          ctx.fillStyle = '#a5b4fc';
-          ctx.font = '11px monospace';
-          ctx.fillText(`AI Vision: ${score}% Conf`, box.x + 4, box.y - 6);
-
-          // Draw refined landmarks
-          if (det.landmarks) {
-            const pts = det.landmarks.positions;
-            ctx.fillStyle = 'rgba(99,102,241,0.7)';
-            pts.forEach(pt => {
-              ctx.beginPath();
-              ctx.arc(pt.x, pt.y, 1.2, 0, 2 * Math.PI);
-              ctx.fill();
-            });
-
-            // Draw eye contour polygons
-            drawEyeContour(ctx, det.landmarks.getLeftEye(), '#10b981');
-            drawEyeContour(ctx, det.landmarks.getRightEye(), '#10b981');
-
-            // Draw gaze direction arrow
-            drawGazeArrow(ctx, det.landmarks, displaySize);
-          }
-
-          // Emotion label
-          if (det.expressions) {
-            const topEmotion = Object.entries(det.expressions)
-              .sort((a, b) => b[1] - a[1])[0];
-            const emotionLabel = `${emotionEmoji(topEmotion[0])} ${topEmotion[0].toUpperCase()} (${Math.round(topEmotion[1] * 100)}%)`;
-            ctx.fillStyle = 'rgba(11,15,25,0.8)';
-            ctx.fillRect(box.x, box.y + box.height + 2, 180, 20);
-            ctx.fillStyle = '#a78bfa';
-            ctx.font = '11px monospace';
-            ctx.fillText(emotionLabel, box.x + 4, box.y + box.height + 16);
-          }
-        });
-      }
-
-      const faceCount = detections.length;
-
-      if (faceCount === 0) {
-        return buildResult({ faceDetected: false, faceCount: 0, eyeStatus: 'NO_FACE', attentionScore: 0 });
-      }
-
-      if (faceCount > 1) {
-        return buildResult({ faceDetected: true, faceCount, eyeStatus: 'MULTIPLE_FACES', attentionScore: 15 });
-      }
-
-      const det = detections[0];
-      const landmarks = det.landmarks;
-
-      // Head orientation approximated from landmark geometry (not PnP solving).
-      const headPose = estimateHeadPose(landmarks.positions, videoElement.videoWidth, videoElement.videoHeight);
-
-      // === Eye Aspect Ratio (EAR) for drowsiness detection ===
-      const leftEAR = computeEAR(landmarks.getLeftEye());
-      const rightEAR = computeEAR(landmarks.getRightEye());
-      const avgEAR = (leftEAR + rightEAR) / 2;
-      const eyesClosed = avgEAR < 0.2;
-
-      // === Gaze direction ===
-      let eyeStatus = 'CENTER';
-      if (eyesClosed) {
-        eyeStatus = 'EYES_CLOSED';
-      } else if (Math.abs(headPose.yaw) > 18) {
-        eyeStatus = 'LOOKING_AWAY';
-      } else if (Math.abs(headPose.pitch) > 15) {
-        eyeStatus = 'LOOKING_DOWN';
-      }
-
-      // === Dominant emotion ===
-      let dominantEmotion = 'neutral';
-      if (det.expressions) {
-        dominantEmotion = Object.entries(det.expressions).sort((a, b) => b[1] - a[1])[0][0];
-      }
-
-      // === Temporal smoothing via Exponential Moving Average ===
-      const rawScore = computeAttentionScore(headPose, avgEAR, eyeStatus, faceCount);
-      const smoothedScore = applyEMA(rawScore);
-
-      return buildResult({
-        faceDetected: true,
-        faceCount: 1,
-        eyeStatus,
-        attentionScore: smoothedScore,
-        headPose,
-        earScore: avgEAR,
-        dominantEmotion,
-        eyesClosed,
-      });
-
-    } catch (e) {
-      // A throw here means the nets loaded but inference failed. That is a real
-      // degradation, so record it rather than quietly switching engines.
-      engineState.mode = 'DEGRADED';
-      engineState.reason = `Inference error: ${e.message}`;
-      console.error('[Vision] DEGRADED —', engineState.reason);
-    }
-  }
-
-  return presenceOnlyFallback(videoElement, canvasElement);
-};
-
-const drawEyeContour = (ctx, eyePoints, color) => {
-  if (!eyePoints || eyePoints.length === 0) return;
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  eyePoints.forEach((pt, i) => {
-    i === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y);
-  });
-  ctx.closePath();
-  ctx.stroke();
-};
-
-const drawGazeArrow = (ctx, landmarks, displaySize) => {
-  const nose = landmarks.getNose();
-  const leftEye = landmarks.getLeftEye();
-  const rightEye = landmarks.getRightEye();
-  if (!nose || !leftEye || !rightEye) return;
-
-  const eyeMidX = (leftEye[0].x + rightEye[3].x) / 2;
-  const eyeMidY = (leftEye[0].y + rightEye[3].y) / 2;
-  const noseX = nose[3].x;
-  const noseY = nose[6].y;
-
-  const dx = noseX - eyeMidX;
-  const dy = noseY - eyeMidY;
-
-  ctx.strokeStyle = '#f59e0b';
-  ctx.lineWidth = 2;
-  ctx.shadowColor = '#f59e0b';
-  ctx.shadowBlur = 6;
-  ctx.beginPath();
-  ctx.moveTo(eyeMidX, eyeMidY);
-  ctx.lineTo(eyeMidX + dx * 2, eyeMidY + dy * 2);
-  ctx.stroke();
-  ctx.shadowBlur = 0;
-};
-
-const estimateHeadPose = (positions, imgWidth, imgHeight) => {
+/** Releases the model and its GPU resources. */
+export const disposeFaceModels = () => {
   try {
-    // Simplified Euler angle estimation from facial landmark geometry
-    const leftEyeCenter = positions[36];
-    const rightEyeCenter = positions[45];
-    const noseTip = positions[30];
-    const chinTip = positions[8];
-
-    const dx = rightEyeCenter.x - leftEyeCenter.x;
-    const dy = rightEyeCenter.y - leftEyeCenter.y;
-
-    const roll = Math.atan2(dy, dx) * (180 / Math.PI);
-    const yaw = ((noseTip.x - (leftEyeCenter.x + rightEyeCenter.x) / 2) / (imgWidth * 0.5)) * 50;
-    const pitch = ((noseTip.y - (leftEyeCenter.y + rightEyeCenter.y) / 2) / (imgHeight * 0.5)) * 40;
-
-    return {
-      yaw: Math.round(yaw * 10) / 10,
-      pitch: Math.round(pitch * 10) / 10,
-      roll: Math.round(roll * 10) / 10,
-    };
+    landmarker?.close();
   } catch {
-    return { yaw: 0, pitch: 0, roll: 0 };
+    /* already torn down */
   }
-};
-
-const computeEAR = (eyePoints) => {
-  if (!eyePoints || eyePoints.length < 6) return 0.3;
-  const A = dist(eyePoints[1], eyePoints[5]);
-  const B = dist(eyePoints[2], eyePoints[4]);
-  const C = dist(eyePoints[0], eyePoints[3]);
-  return (A + B) / (2.0 * C);
-};
-
-const dist = (p1, p2) => {
-  return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
-};
-
-const computeAttentionScore = (headPose, ear, eyeStatus, faceCount) => {
-  let score = 100;
-  score -= Math.min(30, Math.abs(headPose.yaw) * 1.2);
-  score -= Math.min(20, Math.abs(headPose.pitch) * 1.0);
-  score -= Math.min(15, Math.abs(headPose.roll) * 0.6);
-  if (eyeStatus === 'EYES_CLOSED') score -= 30;
-  if (eyeStatus === 'LOOKING_AWAY') score -= 25;
-  if (eyeStatus === 'LOOKING_DOWN') score -= 10;
-  if (ear < 0.2) score -= 15;
-  if (faceCount === 0) score = 0;
-  return Math.max(0, Math.min(100, Math.round(score)));
-};
-
-const applyEMA = (newScore, alpha = 0.35) => {
-  frameBuffer.push(newScore);
-  if (frameBuffer.length > BUFFER_SIZE) frameBuffer.shift();
-  return Math.round(
-    frameBuffer.reduce((acc, s, i) => {
-      const weight = Math.pow(1 - alpha, frameBuffer.length - 1 - i);
-      return acc + s * weight;
-    }, 0) / frameBuffer.reduce((acc, _, i) => acc + Math.pow(1 - alpha, frameBuffer.length - 1 - i), 0)
-  );
+  landmarker = null;
+  loadPromise = null;
+  lastVideoTime = -1;
+  lastResult = null;
+  smoother.reset();
 };
 
 /**
- * Missing values are null, never a plausible-looking default. A caller that
- * receives null must render "unavailable", not a number. The previous defaults
- * (score 90, pose {0,0,0}, EAR 0.3, 'neutral') were indistinguishable from real
- * readings and are the reason the HUD appeared to work while measuring nothing.
- */
-const buildResult = (data) => ({
-  faceDetected: data.faceDetected ?? null,
-  faceCount: data.faceCount ?? null,
-  eyeStatus: data.eyeStatus ?? 'UNKNOWN',
-  attentionScore: data.attentionScore ?? null,
-  headPose: data.headPose ?? null,
-  earScore: data.earScore ?? null,
-  dominantEmotion: data.dominantEmotion ?? null,
-  eyesClosed: data.eyesClosed ?? null,
-  presenceHint: data.presenceHint ?? null,
-  engine: data.engine ?? engineState.mode,
-  timestamp: Date.now(),
-});
-
-const emotionEmoji = (emotion) => {
-  const map = { happy: '😊', sad: '😔', surprised: '😲', fearful: '😨', disgusted: '🤢', angry: '😠', neutral: '😐' };
-  return map[emotion] || '😐';
-};
-
-/**
- * DEGRADED path — used only when the face models are unavailable.
+ * Runs one inference against the current video frame.
  *
- * This is a skin-tone and brightness pixel count. It is not face detection and
- * it is not attention measurement: it cannot locate a face, count faces, tell
- * where someone is looking, or tell whether their eyes are open. A bare arm or
- * a warm-toned wall will satisfy it.
- *
- * It therefore returns a presence HINT and nothing else. Every measured field is
- * null so that no caller can accidentally render heuristic output as telemetry.
+ * Returns null when the pipeline cannot produce a reading — there is no
+ * fabricated score and no fallback that invents a face. Callers must handle
+ * null by reporting nothing.
  */
-const presenceOnlyFallback = (videoElement, canvasElement) => {
+export const detectAttention = (videoElement, canvasElement) => {
+  if (!landmarker || !videoElement || videoElement.readyState < 2) return null;
+  if (!videoElement.videoWidth || !videoElement.videoHeight) return null;
+
+  // detectForVideo requires a strictly increasing timestamp; re-running on the
+  // same frame throws, so reuse the previous result instead.
+  const now = performance.now();
+  if (videoElement.currentTime === lastVideoTime) return lastResult;
+  lastVideoTime = videoElement.currentTime;
+
+  let result;
   try {
-    const width = videoElement.videoWidth || 480;
-    const height = videoElement.videoHeight || 360;
-
-    const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = width;
-    tempCanvas.height = height;
-    const ctx = tempCanvas.getContext('2d');
-    ctx.drawImage(videoElement, 0, 0, width, height);
-
-    const imageData = ctx.getImageData(0, 0, width, height);
-    const data = imageData.data;
-
-    let skinPixels = 0;
-    let totalBrightness = 0;
-    let motionPixels = 0;
-    const totalPixels = (width * height) / 4;
-
-    for (let i = 0; i < data.length; i += 16) {
-      const r = data[i], g = data[i + 1], b = data[i + 2];
-      const brightness = (r + g + b) / 3;
-      totalBrightness += brightness;
-
-      // Skin tone detection: YCbCr color space approximation
-      const Y = 0.299 * r + 0.587 * g + 0.114 * b;
-      const Cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
-      const Cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
-      if (Y > 80 && Cb >= 77 && Cb <= 127 && Cr >= 133 && Cr <= 173) {
-        skinPixels++;
-      }
-    }
-
-    const skinRatio = skinPixels / totalPixels;
-    const avgBrightness = totalBrightness / totalPixels;
-
-    // Presence hint only. Deliberately NOT called faceDetected — this cannot
-    // distinguish a face from any other skin-toned region in frame.
-    const presenceHint = skinRatio > 0.06 && avgBrightness > 30;
-
-    // No bounding box is drawn: there is no detection to draw a box around.
-    // Drawing one previously made the degraded path look identical to the CNN path.
-    if (canvasElement) {
-      const oc = canvasElement.getContext('2d');
-      oc.clearRect(0, 0, width, height);
-      oc.fillStyle = 'rgba(180,83,9,0.85)';
-      oc.fillRect(0, 0, width, 26);
-      oc.fillStyle = '#fef3c7';
-      oc.font = 'bold 12px monospace';
-      oc.fillText('DEGRADED - no face model. Not measuring attention.', 8, 17);
-    }
-
-    return buildResult({
-      faceDetected: null,
-      faceCount: null,
-      eyeStatus: 'UNAVAILABLE',
-      attentionScore: null,
-      headPose: null,
-      presenceHint,
-      engine: 'DEGRADED',
-    });
+    result = landmarker.detectForVideo(videoElement, now);
   } catch (err) {
-    return buildResult({ eyeStatus: 'UNAVAILABLE', engine: 'DEGRADED' });
+    console.warn('[Proctoring] inference failed:', err?.message);
+    return null;
   }
+
+  const faces = result.faceLandmarks || [];
+  const faceCount = faces.length;
+
+  if (faceCount === 0) {
+    lastResult = buildReading({
+      faceDetected: false,
+      faceCount: 0,
+      eyeStatus: 'NO_FACE',
+      attentionScore: smoother.push(0),
+    });
+    drawOverlay(canvasElement, videoElement, null, lastResult);
+    return lastResult;
+  }
+
+  const landmarks = faces[0];
+  const blendshapes = result.faceBlendshapes?.[0]?.categories || null;
+  const matrix = result.facialTransformationMatrixes?.[0]?.data || null;
+
+  const headPose = eulerFromMatrix(matrix);
+
+  const leftEar = computeEAR(landmarks, LEFT_EYE_EAR);
+  const rightEar = computeEAR(landmarks, RIGHT_EYE_EAR);
+  const earScore = (leftEar + rightEar) / 2;
+
+  const blinkScore = Math.max(
+    blendshape(blendshapes, 'eyeBlinkLeft'),
+    blendshape(blendshapes, 'eyeBlinkRight')
+  );
+  const eyesClosed = blinkScore > THRESHOLDS.eyesClosedBlendshape
+    || earScore < THRESHOLDS.eyesClosedEar;
+
+  const gaze = gazeDeviation(blendshapes);
+  const eyeStatus = classifyEyeStatus({ faceCount, eyesClosed, headPose, gaze });
+  const rawScore = computeAttentionScore({ faceCount, eyeStatus, headPose, gaze });
+
+  lastResult = buildReading({
+    faceDetected: true,
+    faceCount,
+    eyeStatus,
+    attentionScore: smoother.push(rawScore),
+    headPose,
+    earScore: Math.round(earScore * 1000) / 1000,
+    gaze: Math.round(gaze * 100) / 100,
+    dominantEmotion: dominantExpression(blendshapes),
+    eyesClosed,
+  });
+
+  drawOverlay(canvasElement, videoElement, { landmarks, faces }, lastResult);
+  return lastResult;
 };
+
+// ────────────────────────────── overlay drawing ─────────────────────────────
+
+const COLOURS = {
+  box: '#6366f1',
+  corner: '#10b981',
+  eye: '#10b981',
+  gaze: '#f59e0b',
+  warn: '#f43f5e',
+};
+
+/**
+ * Draws the box, eye contours and gaze vector. Kept lightweight: the full 478
+ * point tessellation is drawn as a sparse cloud rather than a mesh so this
+ * stays cheap enough to run every frame.
+ */
+const drawOverlay = (canvas, video, detection, reading) => {
+  if (!canvas) return;
+
+  const width = video.videoWidth;
+  const height = video.videoHeight;
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, width, height);
+
+  if (!detection) {
+    ctx.fillStyle = 'rgba(244,63,94,0.12)';
+    ctx.fillRect(0, 0, width, height);
+    ctx.fillStyle = COLOURS.warn;
+    ctx.font = 'bold 16px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No face detected', width / 2, height / 2);
+    ctx.textAlign = 'left';
+    return;
+  }
+
+  const { landmarks, faces } = detection;
+  const multiple = faces.length > 1;
+  const box = landmarkBounds(landmarks, width, height);
+  if (!box) return;
+
+  // Bounding box with corner brackets.
+  const accent = multiple ? COLOURS.warn : COLOURS.box;
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 2;
+  ctx.shadowColor = accent;
+  ctx.shadowBlur = 10;
+  ctx.strokeRect(box.x, box.y, box.width, box.height);
+  ctx.shadowBlur = 0;
+
+  const cornerLength = Math.min(18, box.width / 4);
+  ctx.strokeStyle = multiple ? COLOURS.warn : COLOURS.corner;
+  ctx.lineWidth = 3;
+  [
+    [box.x, box.y, 1, 1],
+    [box.x + box.width, box.y, -1, 1],
+    [box.x, box.y + box.height, 1, -1],
+    [box.x + box.width, box.y + box.height, -1, -1],
+  ].forEach(([cx, cy, sx, sy]) => {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + sy * cornerLength);
+    ctx.lineTo(cx, cy);
+    ctx.lineTo(cx + sx * cornerLength, cy);
+    ctx.stroke();
+  });
+
+  // Sparse landmark cloud.
+  ctx.fillStyle = 'rgba(99,102,241,0.45)';
+  for (let i = 0; i < landmarks.length; i += 6) {
+    const point = landmarks[i];
+    ctx.fillRect(point.x * width, point.y * height, 1.4, 1.4);
+  }
+
+  // Eye rings.
+  ctx.strokeStyle = reading.eyesClosed ? COLOURS.warn : COLOURS.eye;
+  ctx.lineWidth = 1.5;
+  [LEFT_EYE_EAR, RIGHT_EYE_EAR].forEach(ring => {
+    ctx.beginPath();
+    ring.forEach((index, position) => {
+      const point = landmarks[index];
+      if (!point) return;
+      const x = point.x * width;
+      const y = point.y * height;
+      if (position === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.closePath();
+    ctx.stroke();
+  });
+
+  // Gaze vector projected from the nose tip using the head rotation.
+  const nose = landmarks[1];
+  if (nose) {
+    const originX = nose.x * width;
+    const originY = nose.y * height;
+    const length = box.width * 0.6;
+    const dx = Math.sin((reading.headPose.yaw * Math.PI) / 180) * length;
+    const dy = Math.sin((reading.headPose.pitch * Math.PI) / 180) * length;
+
+    ctx.strokeStyle = COLOURS.gaze;
+    ctx.lineWidth = 2;
+    ctx.shadowColor = COLOURS.gaze;
+    ctx.shadowBlur = 6;
+    ctx.beginPath();
+    ctx.moveTo(originX, originY);
+    ctx.lineTo(originX - dx, originY + dy);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
+  // Readout.
+  const label = multiple
+    ? `${faces.length} FACES IN FRAME`
+    : `${reading.attentionScore}% attention · ${reading.eyeStatus.replace(/_/g, ' ').toLowerCase()}`;
+
+  ctx.fillStyle = 'rgba(11,15,25,0.8)';
+  ctx.fillRect(box.x, Math.max(0, box.y - 24), Math.max(180, ctx.measureText(label).width + 16), 22);
+  ctx.fillStyle = multiple ? COLOURS.warn : '#a5b4fc';
+  ctx.font = '12px ui-monospace, monospace';
+  ctx.fillText(label, box.x + 6, Math.max(14, box.y - 8));
+};
+
+export { THRESHOLDS };

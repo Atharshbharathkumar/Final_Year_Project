@@ -6,17 +6,11 @@ import lombok.*;
 import java.time.LocalDateTime;
 
 /**
- * A student's response to an assignment.
- *
- * Text-only: there is no file upload. Storing binaries would need a storage
- * strategy and virus scanning that this project does not have, so the scope is
- * an explicit text answer plus an optional external link.
+ * A student's working state against one assignment. A row is created lazily the
+ * first time a student starts or submits, so "no row" means PENDING.
  */
 @Entity
-@Table(
-    name = "submissions",
-    uniqueConstraints = @UniqueConstraint(columnNames = {"assignment_id", "student_id"})
-)
+@Table(name = "submissions", uniqueConstraints = @UniqueConstraint(columnNames = {"assignment_id", "student_id"}))
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
@@ -35,30 +29,25 @@ public class Submission {
     @JoinColumn(name = "student_id", nullable = false)
     private User student;
 
-    @Column(length = 8000)
-    private String content;
+    @Enumerated(EnumType.STRING)
+    private Status status;
 
-    private String linkUrl;
-
-    private LocalDateTime submittedAt;
-
-    /** True when submittedAt is after the assignment's dueDate. Set on submit. */
-    private Boolean late;
-
-    // --- Grading. Null until a teacher grades it. ---
-    private Integer marksAwarded;
+    private String fileName;
 
     @Column(length = 2000)
     private String feedback;
 
-    @ManyToOne(fetch = FetchType.EAGER)
-    @JoinColumn(name = "graded_by_id")
-    private User gradedBy;
+    /** Marks awarded out of the assignment's points. */
+    private Integer grade;
 
+    private LocalDateTime startedAt;
+    private LocalDateTime submittedAt;
     private LocalDateTime gradedAt;
 
-    @PrePersist
-    protected void onCreate() {
-        if (submittedAt == null) submittedAt = LocalDateTime.now();
+    public enum Status {
+        PENDING,
+        IN_PROGRESS,
+        SUBMITTED,
+        GRADED
     }
 }
