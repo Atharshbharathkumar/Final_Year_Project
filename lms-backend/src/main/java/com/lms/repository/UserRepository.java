@@ -1,5 +1,6 @@
 package com.lms.repository;
 
+import com.lms.model.Department;
 import com.lms.model.User;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
@@ -12,4 +13,7 @@ public interface UserRepository extends JpaRepository<User, Long> {
     Optional<User> findByEmail(String email);
     Boolean existsByEmail(String email);
     List<User> findByRole(User.Role role);
+    List<User> findByRoleAndDepartment(User.Role role, Department department);
+    long countByRole(User.Role role);
+    long countByRoleAndDepartment(User.Role role, Department department);
 }

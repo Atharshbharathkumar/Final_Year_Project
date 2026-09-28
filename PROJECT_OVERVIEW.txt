@@ -1,0 +1,1450 @@
+================================================================================
+EDUVERSE AI / SMARTLMS
+Complete Project Reference - Features, Novelty, Internals, and Roadmap
+================================================================================
+
+Generated: 2026-09-23
+Scope: everything in this repository (lms-backend, lms-frontend, paper/main.tex)
+
+Written from the source code, not from the abstract. Where the research paper
+and the running code disagree, Section 16 says so explicitly.
+
+Two names are in play:
+  "EduVerse AI"  - the name used in the product, the README and the UI.
+  "SmartLMS"     - the name used in the IEEE paper (paper/main.tex).
+They are the same system. Pick one before submission.
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+ 1.  What this project is
+ 2.  Technology stack
+ 3.  How to run it
+ 4.  Roles and access model
+ 5.  Feature inventory, module by module
+ 6.  The algorithms in full detail (every constant)
+ 7.  Novelty - what is actually new here
+ 8.  Privacy and responsible-AI design
+ 9.  Security model
+10.  Data model
+11.  API surface
+12.  Realtime (WebSocket) surface
+13.  Seed data
+14.  Testing
+15.  Configuration
+16.  PAPER vs CODE - claims not backed by the implementation  ** READ THIS **
+17.  Known limitations, not built, and unverified
+18.  YET TO IMPLEMENT - full roadmap
+19.  File map
+
+
+================================================================================
+1. WHAT THIS PROJECT IS
+================================================================================
+
+A full-stack Learning Management System that adds two things ordinary LMS
+platforms do not have:
+
+  (a) ENGAGEMENT INTELLIGENCE - it measures whether a student is actually
+      paying attention during a live session, using computer vision that runs
+      entirely inside the student's own browser, and turns those measurements
+      into pedagogical states, risk bands, and teacher interventions.
+
+  (b) PROCTORING WITHOUT VIDEO UPLOAD - exam integrity monitoring where no
+      image or video frame ever leaves the student's device. Only derived
+      numbers (an attention score, a face count, an eye-status token, a tab
+      focus flag) are posted to the server.
+
+Around those two pillars sits a complete, working LMS: courses, enrolments,
+assignments, submissions, grading, proctored online exams, live classrooms with
+chat and focus enforcement, attendance, campus events, notifications,
+co-curricular credits, a study assistant, and a resume scorer.
+
+The governing design rule, stated throughout the codebase and the paper:
+
+    AN UNMEASURED QUANTITY IS REPORTED AS UNMEASURED, NEVER SILENTLY DEFAULTED.
+
+A broken camera must produce an absence of data, not a fake score.
+
+A second governing rule: NO MOCK DATA IN THE FRONTEND. Every number on every
+screen is computed on the server from rows that exist in the database. There is
+no randomisation at read time and no hard-coded dashboard figure.
+
+
+================================================================================
+2. TECHNOLOGY STACK
+================================================================================
+
+BACKEND (lms-backend) - 104 Java files
+  Java 17
+  Spring Boot 3.2
+  Spring Security + JWT (JSON Web Tokens), BCrypt password hashing
+  Spring Data JPA / Hibernate
+  H2 file-backed database by default (data/lmsdb.mv.db); MySQL-ready via DB_URL
+  Spring WebSocket with STOMP over SockJS
+  Lombok
+  Maven
+
+FRONTEND (lms-frontend) - React single-page application
+  React 18
+  Vite 5 (build and dev server)
+  Tailwind CSS 3
+  React Router 6
+  Axios (REST)
+  @stomp/stompjs + sockjs-client (realtime)
+  Recharts (charts)
+  Framer Motion (animation)
+  lucide-react (icons)
+  @mediapipe/tasks-vision 1.x (the vision model runtime)
+  simple-peer 9.x  -- INSTALLED BUT CURRENTLY UNUSED (see Sections 16 and 18)
+
+VISION ASSETS (served from lms-frontend/public - no CDN, no internet needed)
+  public/models/face_landmarker.task   - 3,758,596 bytes (~3.7 MB)
+  public/mediapipe/wasm/               - SIMD and non-SIMD WASM runtimes
+
+TESTING
+  Backend: JUnit 5, Mockito, Spring Boot Test  (151 tests)
+  Frontend: Vitest + Testing Library + jsdom   (56 tests)
+  E2E: playwright-core driving an already-installed browser (smoke run)
+
+
+================================================================================
+3. HOW TO RUN IT
+================================================================================
+
+Two processes. Start the backend first.
+
+  cd lms-backend
+  mvn spring-boot:run            ->  http://localhost:8080
+
+  cd lms-frontend
+  npm install
+  npm run dev                    ->  http://localhost:5173
+
+Requires JDK 17+, Maven, and Node.
+
+FIRST START seeds a complete 8-week demonstration term into H2.
+
+TO WIPE AND RE-SEED:
+  rm -rf lms-backend/data        (Windows: rmdir /s /q lms-backend\data)
+
+IMPORTANT OPERATIONAL TRAP
+--------------------------
+Hibernate runs with ddl-auto=update. It creates a CHECK constraint listing an
+enum's values when a table is first created, and NEVER alters that constraint
+afterwards. So if you add a new constant to any database-backed enum
+(AlertType, LearningState, AttemptStatus, Role, Status ...), inserting it
+against an old database fails with:
+
+    Check constraint violation: CONSTRAINT_7
+
+You must drop data/ and re-seed. This is the single most common way to break a
+demo, and it will happen the first time you extend an enum.
+
+DEMO ACCOUNTS (password for all four: password)
+
+  Student   student@edu.in   ->  /student/dashboard
+  Teacher   teacher@edu.in   ->  /teacher/dashboard
+  Parent    parent@edu.in    ->  /parent/dashboard
+  Admin     admin@edu.in     ->  /admin/dashboard
+
+The role selector on the login page only PREFILLS these credentials. The server
+decides the real role from the authenticated user - you cannot escalate by
+picking a different tile.
+
+
+================================================================================
+4. ROLES AND ACCESS MODEL
+================================================================================
+
+Four roles: STUDENT, TEACHER, PARENT (guardian), ADMIN.
+
+  STUDENT   Sees only their own record. Takes exams, submits assignments, joins
+            live classes, is monitored (with consent), uses the AI assistant and
+            resume scorer, views their own learning state and digital twin.
+
+  TEACHER   Sees students enrolled in courses they own - and only those. Creates
+            courses, assignments and exams; grades submissions; hosts live
+            classes; sees the live alert feed, the Class Focus panel, and can
+            readmit removed students. Reviews and approves or rejects
+            interventions.
+
+  PARENT    Sees exactly one linked child's record and nothing beyond it. This
+            is enforced server-side and explicitly tested.
+
+  ADMIN     Platform-wide analytics, departments, and every session. Can act on
+            any classroom session.
+
+Enforcement: unauthenticated -> 401. Authenticated but wrong role -> 403.
+
+Critically, IDENTITY IS TAKEN FROM THE SECURITY CONTEXT, NOT FROM THE REQUEST
+BODY. A student cannot read a peer's record by passing ?studentId=, and cannot
+post attention telemetry in someone else's name. Both are covered by tests.
+
+
+================================================================================
+5. FEATURE INVENTORY, MODULE BY MODULE
+================================================================================
+
+5.1 AUTHENTICATION
+    - POST /api/auth/login, /register; GET /api/auth/me
+    - JWT bearer tokens, configurable lifetime (default 24 hours)
+    - BCrypt password hashing
+    - Role resolved server-side from the user record
+
+5.2 DASHBOARDS (one per role)
+    Student:  engagement score, GPA, attendance, course cards with progress and
+              letter grade, upcoming work, notifications, learning state.
+    Teacher:  roster with risk bands, live alert feed, class analytics, grading
+              queue, intervention queue.
+    Parent:   the linked child's engagement, attendance, grades and alerts.
+    Admin:    platform engagement, department comparison, 8-month growth trend,
+              active session count.
+    Every figure is produced by AnalyticsService (Section 6.1).
+
+5.3 COURSES
+    - GET /api/courses/my, /{id}; POST /api/courses (create); /{id}/enroll
+    - Course progress = 50% syllabus coverage + 50% that student's completion
+    - Per-course score percentage and letter grade
+
+5.4 ASSIGNMENTS AND GRADING
+    - Create (teacher), list (student), start, submit
+    - Submission states: PENDING, IN_PROGRESS, SUBMITTED, GRADED
+    - Teacher grading is scoped to the COURSE OWNER - a teacher cannot grade
+      another teacher's course. Mark bounds are validated.
+    - A recorded mark writes straight back into AnalyticsService, so the
+      student's GPA, assignment completion and engagement score all move on the
+      next page load, and the student is notified over WebSocket.
+
+5.5 PROCTORED ONLINE EXAMS
+    - Question types include MCQ and written
+    - THE ANSWER KEY NEVER REACHES THE BROWSER. The candidate's paper is served
+      through a DTO that has no correctAnswer field at all. The endpoint that
+      does carry it (GET /api/exams/{id}) is restricted to staff.
+    - Answers autosave as the candidate works
+    - The countdown runs on the SERVER clock, bounded by both the attempt
+      duration and the exam window
+    - Resume-not-restart: reopening an attempt resumes it
+    - One sitting per candidate
+    - Every attempt operation verifies the attempt belongs to the caller
+    - TAB SWITCHES ARE COUNTED SERVER-SIDE. A client that declines to report
+      them cannot lower the count. Reaching the per-exam limit finalises the
+      attempt as AUTO_SUBMITTED_VIOLATION and raises a CRITICAL alert.
+    - Submission is idempotent
+    - Results carry score, max score, percentage, tab switch count, status
+
+5.6 LIVE CLASSROOM
+    - Sessions created by a teacher against a course, with chat history
+
+    - CLASSROOM LOBBY: a student never enters implicitly. The lobby states what
+      the class is and what will be monitored. The Join button stays DISABLED
+      until the student shares their screen - and a single tab or window is
+      REJECTED. The share is accepted only when displaySurface reports
+      'monitor', because sharing one tab would defeat the purpose.
+
+    - FOCUS ENFORCEMENT (3-strike escalation, server-owned):
+        strike 1  ->  room blocked with a warning overlay
+        strike 2  ->  final warning
+        strike 3  ->  removed from the session
+      Each strike raises an alert on the teacher's live feed with rising
+      severity. The count lives on the server so a client cannot wind it back.
+
+    - REMOVAL SURVIVES A REJOIN: the client checks its standing on entering the
+      room (GET /api/classroom/{id}/my-standing), so reloading does not escape
+      the block.
+
+    - CLASS FOCUS PANEL: the host teacher sees everyone with strikes and can
+      readmit with one click. Readmission marks the offending alerts RESOLVED
+      rather than deleting them - the strikes stop counting, but the session
+      report still shows what happened and who forgave it. The readmitted
+      student's block lifts immediately over /topic/classroom/{sessionId} with
+      no reload. Only the hosting teacher (or an admin) can see the panel or
+      readmit anyone.
+
+    - HONEST SCOPE, stated in the product itself: a web page cannot see which
+      application a student switched to, and cannot close it. Both are browser
+      security boundaries. "Enforcement" here means blocking our own room,
+      reporting to the teacher, and removing the student - not terminating
+      anything on their machine.
+
+5.7 CAMERA PROCTORING / VISION PIPELINE
+    Files: lms-frontend/src/utils/faceDetection.js  (MediaPipe wiring)
+           lms-frontend/src/utils/faceScoring.js    (pure maths, unit-tested)
+           lms-frontend/src/components/proctoring/ProctoringCamera.jsx  (UI)
+
+    - MediaPipe FaceLandmarker runs entirely in the browser, producing per face:
+        478 three-dimensional landmarks
+        52 blendshape coefficients
+        a 4x4 facial transformation matrix
+    - GPU delegate first, with automatic CPU fallback if GPU initialisation fails
+    - numFaces = 2 (enough to detect "someone else is in the room")
+    - Head pose is READ FROM THE TRANSFORMATION MATRIX, not approximated from
+      landmark ratios
+    - Eye state comes from the blink blendshapes CROSS-CHECKED against a
+      geometric eye aspect ratio
+    - Gaze drift comes from the eye-look blendshapes, which catches a candidate
+      reading from a second screen even when their head never moves
+    - Scores are smoothed with an exponential moving average so a blink does not
+      read as disengagement
+    - The camera never opens without an explicit click; consent is revocable
+      with one control; component states are idle / starting / active / denied /
+      error / stopped
+    - WHEN THE MODEL OR CAMERA IS UNAVAILABLE THE COMPONENT SAYS SO AND POSTS
+      NOTHING. There is no fallback that invents a score.
+    - Readings are posted on a fixed cadence (5000 ms), not every frame
+    - A dropped reading is swallowed rather than interrupting an exam
+
+5.8 ATTENTION MONITORING AND ALERTS (server side)
+    - POST /api/monitoring/attention is ATTRIBUTED TO THE AUTHENTICATED CALLER,
+      never to a studentId in the body
+    - Automatic alert rules evaluated on each reading:
+        faceDetected == false                  ->  NO_FACE         HIGH
+        faceCount > 1                          ->  MULTIPLE_FACES  CRITICAL
+        eyeStatus LOOKING_AWAY or EYES_CLOSED  ->  LOOKING_AWAY    LOW
+        isTabActive == false                   ->  TAB_SWITCH      HIGH
+    - Every alert is persisted AND pushed to two topics: the session room feed
+      and the platform-wide invigilator feed, so an open dashboard sees it with
+      no polling
+    - Snapshot capture exists (base64 -> uploads/snapshots/, flagged when the
+      trigger is MULTI_FACE or TAB_SWITCH) but is UNVERIFIED (Section 17)
+
+5.9 ADAPTIVE LEARNING STATE ENGINE (ALSE)
+    The pedagogical layer on top of raw attention. Six states:
+        DEEP_LEARNING, FOCUSED, COLLABORATIVE,
+        PASSIVE_LEARNING, DISTRACTED, STRUGGLING
+
+    - Classifies each attention reading into one state with EVIDENCE TEXT and a
+      confidence figure
+    - STORES ONLY TRANSITIONS, not every reading, so the timeline stays readable
+      instead of repeating the same state every few seconds. A watermark tracks
+      the last processed reading, so re-syncing is incremental and idempotent.
+    - Builds three products from that history:
+        DIGITAL TWIN        state distribution, dominant state, inferred
+                            learning characteristics, intervention success rate
+        INTERVENTION QUEUE  automatic actions for high-risk students, with
+                            evidence, a recommendation, an objective, a captured
+                            baseline, and live outcome measurement
+        WHAT-IF SIMULATOR   scenario forecasting against the cohort's real
+                            distribution
+    - EXPLAINABLE SCORE: breaks engagement into seven weighted factors so the UI
+      can show the "why" next to the "what", and names the weakest two as the
+      improvement area
+
+5.10 AI INTELLIGENCE LAYER
+    - RISK PREDICTION (GET /api/ai/predict-risk/{id}): exponentially smoothed
+      attention series blended with alert volume and coursework signals; emits a
+      confusion index and a risk-appropriate recommendation
+    - EXAM INTEGRITY (GET /api/ai/exam-integrity/{id}): weighted integrity model
+      over proctoring telemetry, producing a confidence score, a status band and
+      a list of named anomalies
+    - STUDY COPILOT (POST /api/ai/copilot/ask): keyword-routed assistant
+      answering from THIS STUDENT'S OWN RECORD - deadlines, grades, attendance,
+      engagement, courses, exams, a study plan, credits. Not a canned script,
+      and NOT a large language model (see Sections 16 and 18).
+
+5.11 RESUME SCORING
+    - Actually reads the submitted text. Scores formatting and section coverage,
+      industry skill keywords, experience via action verbs, education, ATS
+      keyword density, and impact (the share of bullet points carrying a
+      measurable number)
+    - Produces per-section scores plus concrete suggestions naming the missing
+      sections and keywords
+    - Deterministic: the same text always scores the same, and editing the
+      resume changes the score. Both properties are unit-tested.
+
+5.12 CAMPUS AND RECORDS
+    - Campus events, notifications, co-curricular CREDIT ACTIVITIES
+    - 60 credits is the honours threshold used by the assistant
+    - Attendance records drive the dashboards (the detailed register VIEW is not
+      built - Section 17)
+
+
+================================================================================
+6. THE ALGORITHMS IN FULL DETAIL (EVERY CONSTANT)
+================================================================================
+
+6.1 ENGAGEMENT SCORE  (AnalyticsService)
+--------------------------------------------------------------------------------
+    Weighted blend; weights sum to 1.0:
+
+        Attendance rate         0.30    from attendance_records
+        Assignment completion   0.25    from submissions vs assigned work
+        Measured attention      0.25    from attention_logs
+        Assessment performance  0.20    from exam_attempts
+
+    RENORMALISATION: components with no data are DROPPED and the remaining
+    weights renormalised, so a brand-new student is not punished for an empty
+    history. If no component has data at all, the score is 0.
+
+    ALERT PENALTY: 3 points per alert raised against the student, CAPPED AT 15,
+    subtracted after the blend. The final value is clamped to 0..100.
+
+6.2 GPA
+--------------------------------------------------------------------------------
+    Mean percentage across graded submissions and non-in-progress exam attempts,
+    mapped as mean/100*4.0, clamped to 0..4.0, rounded to 2 decimals.
+
+6.3 RISK BAND
+--------------------------------------------------------------------------------
+    high     if engagement < 60  OR  attendance < 75
+    medium   if engagement < 75  OR  attendance < 85
+    low      otherwise
+
+    Attendance defaults to 100 when there are no records, so an absence of data
+    cannot manufacture risk.
+
+6.4 LETTER GRADE
+--------------------------------------------------------------------------------
+    >=90 A+ | >=85 A | >=80 A- | >=75 B+ | >=70 B | >=65 B- | >=60 C+ | >=50 C
+    | otherwise D
+
+6.5 COURSE PROGRESS
+--------------------------------------------------------------------------------
+    coverage    = 100 * distinct session dates held / planned total
+                  (planned defaults to 30 when unset)
+    completion  = 100 * that student's done items / the course's assignments
+                  (falls back to coverage when the course has no assignments)
+    progress    = 0.5 * coverage + 0.5 * completion, clamped
+
+6.6 PARTICIPATION
+--------------------------------------------------------------------------------
+    clamp( chats * 12 + submittedOrGraded * 8 )
+
+6.7 EXPLAINABLE SCORE - seven factors, maximum 100
+--------------------------------------------------------------------------------
+        Attendance             20
+        Assignment Completion  20
+        Quiz Participation     15
+        Course Progress        15
+        Class Participation    10
+        Visual Engagement      10
+        Screen Activity        10
+
+    Each factor's impact = clamp(percent)/100 * max.
+    Screen Activity = the share of readings where the course tab still had focus.
+    The improvement area names the two factors with the lowest impact/max ratio.
+
+6.8 VISION THRESHOLDS  (faceScoring.js - single source of truth)
+--------------------------------------------------------------------------------
+        eyesClosedEar          0.18
+        eyesClosedBlendshape   0.50
+        yawAway                20 degrees
+        pitchDown              15 degrees
+        gazeAway               0.45
+        deepAttention          85
+
+6.9 EYE ASPECT RATIO
+--------------------------------------------------------------------------------
+    Six-point rings in EAR order:
+        LEFT   [33, 160, 158, 133, 153, 144]
+        RIGHT  [362, 385, 387, 263, 373, 380]
+
+        EAR = ( |p1-p5| + |p2-p4| ) / ( 2 * |p0-p3| )
+
+    Returns 0 on a missing landmark or a zero horizontal span.
+
+6.10 HEAD POSE FROM THE TRANSFORMATION MATRIX
+--------------------------------------------------------------------------------
+    The matrix arrives COLUMN-MAJOR, so r[row][col] = data[col*4 + row].
+
+        pitch = atan2( r21, r22 )
+        yaw   = atan2( -r20, hypot(r21, r22) )
+        roll  = atan2( r10, r00 )
+
+    Converted to degrees and rounded to 1 decimal. A "+ 0" collapses the
+    negative zero that atan2 produces for a head facing straight ahead, so a
+    level head reads as 0 rather than -0.
+
+    NOTE: this is NOT the convention printed in the paper. See Section 16.4.
+
+6.11 GAZE DEVIATION (0..1, independent of head pose)
+--------------------------------------------------------------------------------
+        left  = max( eyeLookOutLeft,  eyeLookInRight )
+        right = max( eyeLookOutRight, eyeLookInLeft )
+        gaze  = min( 1, max(left, right) )
+
+    Looking sharply left or right pushes this towards 1 EVEN WHEN THE HEAD IS
+    STILL - this is what catches a candidate reading from a second screen.
+
+    NOTE: the paper specifies an AVERAGE over both eyes; the code uses a MAX.
+    See Section 16.5.
+
+6.12 DOMINANT EXPRESSION (coarse label)
+--------------------------------------------------------------------------------
+        smile    = max(mouthSmileLeft, mouthSmileRight)  > 0.40  -> happy
+        surprise = max(browInnerUp, jawOpen)             > 0.45  -> surprised
+        frown    = max(browDownLeft, browDownRight)      > 0.40  -> focused
+        otherwise                                                -> neutral
+
+6.13 EYE STATUS CLASSIFICATION - ORDER MATTERS
+--------------------------------------------------------------------------------
+    Presence beats gaze, and closed eyes beat direction:
+
+        1. faceCount == 0                     ->  NO_FACE
+        2. faceCount >  1                     ->  MULTIPLE_FACES
+        3. eyesClosed                         ->  EYES_CLOSED
+        4. |yaw| > 20  OR  gaze > 0.45        ->  LOOKING_AWAY
+        5. pitch > 15                         ->  LOOKING_DOWN
+        6. otherwise                          ->  CENTER
+
+6.14 ATTENTION SCORE (0..100)
+--------------------------------------------------------------------------------
+    faceCount == 0  ->  0    (nothing measured)
+    faceCount >  1  ->  15   (cannot attribute to an individual)
+
+    Otherwise, starting from 100:
+
+        -= min( 30, |yaw|   * 1.2 )
+        -= min( 20, |pitch| * 1.0 )
+        -= min( 15, |roll|  * 0.6 )
+        -= min( 20,  gaze   * 25  )
+
+        EYES_CLOSED   ->  -30
+        LOOKING_AWAY  ->  -25
+        LOOKING_DOWN  ->  -10
+
+    Clamped to 0..100 and rounded. Head rotation away from the screen costs the
+    most, then eye state, then gaze drift.
+
+    NOTE: these are NOT the coefficients printed in the paper. See Section 16.6.
+
+6.15 SMOOTHING
+--------------------------------------------------------------------------------
+    createSmoother(alpha = 0.35, windowSize = 10)
+
+    A rolling buffer of the last 10 values, weighted by (1-alpha)^age, so recent
+    samples dominate but a single blink cannot swing the reading.
+
+6.16 ALSE STATE CLASSIFICATION - ORDER MATTERS
+--------------------------------------------------------------------------------
+    Inputs: the reading's score, eyeStatus, isTabActive and faceDetected;
+    whether the student was chatting within +/-1 minute; and whether they are
+    struggling academically (mean assessment accuracy < 60).
+
+        1.  chatting now                 ->  COLLABORATIVE (confidence >= 88)
+        2.  tab not active               ->  DISTRACTED
+        3.  no face / NO_FACE            ->  DISTRACTED
+        4.  MULTIPLE_FACES               ->  DISTRACTED
+        5.  LOOKING_AWAY or EYES_CLOSED  ->  PASSIVE_LEARNING
+        6.  struggling AND score < 75    ->  STRUGGLING
+        7.  score >= 85                  ->  DEEP_LEARNING
+        8.  score >= 70                  ->  FOCUSED
+        9.  score >= 50                  ->  PASSIVE_LEARNING
+       10.  otherwise                    ->  DISTRACTED
+
+    CONFIDENCE = clamp to 60..99 of round( 60 + |score - 50| * 0.78 ).
+    Readings far from the midpoint are more confident; ambiguous ones admit it.
+
+    Every state carries human-readable EVIDENCE naming what caused it, for
+    example "Student left the camera frame - no face detected" or "Sustained
+    gaze on course content (attention 91%)".
+
+6.17 TRANSITION-ONLY RECORDING
+--------------------------------------------------------------------------------
+    syncStates() reads the last stored state's timestamp as a WATERMARK, pulls
+    only attention readings newer than it, classifies each, and SAVES ONLY WHERE
+    THE STATE CHANGED. Re-running it is cheap and idempotent.
+
+6.18 PEAK LEARNING WINDOW
+--------------------------------------------------------------------------------
+    Group this student's readings by hour of day, take the hour with the highest
+    mean attention, and render it as "HH:00 - HH:30" with the end hour computed
+    as (peak + 2) mod 24.
+
+6.19 DIGITAL TWIN CHARACTERISTICS
+--------------------------------------------------------------------------------
+    Inferred from where the student actually performs:
+      - whether graded coursework or timed assessments score higher, which
+        decides both "best performance" and "difficulty"
+      - strongest and weakest course by mean graded percentage
+      - the peak learning window above
+
+    Intervention success rate = the share of resolved interventions whose
+    measured outcome score beat the baseline captured when they were raised.
+
+6.20 INTERVENTIONS
+--------------------------------------------------------------------------------
+    - Raised automatically for EVERY high-risk student with no open action
+    - SUPPRESSED if one is already PENDING or APPROVED, or if one was resolved
+      within the last 7 days (COOLDOWN_DAYS = 7) - so the queue does not
+      instantly refill
+    - Carries: trigger state; an evidence list (mean assessment accuracy,
+      assignment completion, attendance, mean measured attention, sessions
+      missed); a recommendation; an objective; and a captured baseline
+      engagement score
+    - The recommendation and objective are chosen per trigger state and name the
+      student's actual weakest course. For example:
+        DISTRACTED        -> "Prompt an interactive pulse-check question ..."
+        PASSIVE_LEARNING  -> "Share a short practice set for <course> ..."
+        STRUGGLING        -> "Recommend a 5-minute concept recap video ..."
+    - Statuses: PENDING / APPROVED / REJECTED. Approving marks it delivered, and
+      the outcome is then measured LIVE against the baseline.
+
+6.21 WHAT-IF SIMULATOR
+--------------------------------------------------------------------------------
+    headroom = max(0, 100 - baseline engagement)
+
+    Each scenario applies a documented uplift model to the cohort's REAL
+    distribution (baseline engagement, mean assessment accuracy, struggling
+    count) rather than returning a fixed number. Example scenario: "Add Revision
+    Video for Struggling Students" projects round(headroom * 0.35).
+
+6.22 AI RISK PREDICTION
+--------------------------------------------------------------------------------
+    EMA over the measured attention series with alpha = 0.3, seeded at 90.0 (or
+    the current engagement score when there are no logs).
+
+        confusionIndex = clamp( (100 - engagement) * 0.9 + alertCount * 4.0 )
+
+    lowAttentionFrequency = the count of readings scoring below 50.
+    The recommendation text is selected by risk band.
+
+6.23 EXAM INTEGRITY MODEL
+--------------------------------------------------------------------------------
+        penalty    = tabSwitches * 25
+                   + max( 0, (80 - averageAttention) * 1.5 )
+                   + proctoringAlerts * 5
+
+        confidence = clamp( 100 - penalty, 0..100 )
+
+        confidence < 50  ->  FLAGGED_HIGH_CHEATING_RISK
+        confidence < 80  ->  MODERATE_REVIEW_RECOMMENDED
+        otherwise        ->  VERIFIED_HIGH_INTEGRITY
+
+    Named anomalies are listed; "No violations registered." when clean.
+
+6.24 STUDY COPILOT ROUTING
+--------------------------------------------------------------------------------
+    Lower-cased keyword matching into eight intents, evaluated in this order:
+
+      due/deadline/assignment/submit/pending  -> outstanding work, earliest first
+      grade/score/gpa/mark/result             -> GPA, mean assessment, best and
+                                                 worst course
+      attendance/absent/present               -> rate with a verdict at 90 / 75
+      engagement/focus/attention/state        -> score, week-over-week trend,
+                                                 current learning state
+      course/subject/enrolled/syllabus        -> enrolments with progress/grade
+      exam/test/quiz                          -> upcoming assessments
+      plan/study/schedule/prepare/revise      -> a four-point plan built from the
+                                                 peak window, weakest course,
+                                                 earliest deadline and attendance
+      credit/achievement/workshop             -> credits banked against 60
+      fallback                                -> overview
+
+    Every reply carries follow-up suggestion chips for the UI.
+
+6.25 EXAM TAB-SWITCH ENFORCEMENT
+--------------------------------------------------------------------------------
+    The count increments SERVER-SIDE. The limit is per-exam (maxTabSwitches).
+    Each switch raises a TAB_SWITCH alert: HIGH normally, CRITICAL on the one
+    that terminates. On reaching the limit the attempt is finalised as
+    AUTO_SUBMITTED_VIOLATION. An already-closed attempt returns terminated=true
+    rather than incrementing further.
+
+6.26 CLASSROOM FOCUS ENFORCEMENT
+--------------------------------------------------------------------------------
+    OFF_TASK_LIMIT = 3. Strikes are counted from UNRESOLVED OFF_TASK alerts in
+    that session, so forgiving an alert genuinely reduces the count.
+    Readmission marks alerts RESOLVED, never deletes them.
+
+
+================================================================================
+7. NOVELTY - WHAT IS ACTUALLY NEW HERE
+================================================================================
+
+Ranked by how defensible each claim is. Claims marked [PAPER ONLY] are asserted
+in paper/main.tex but are NOT in the code - see Section 16.
+
+7.1  CLIENT-SIDE-ONLY VISION WITH A HARD PRIVACY BOUNDARY   [STRONG, IMPLEMENTED]
+     Commercial proctoring uploads video to a server. Here, inference happens in
+     the student's browser and the frame is discarded. The network payload is
+     four scalars: attention score, face count, eye-status token, tab focus flag.
+     The engagement analytics still exist; the video that would have been stored
+     on the institution's servers is simply never generated. The model and WASM
+     runtime are served from the app's own origin, so this works with NO INTERNET
+     CONNECTION and no third-party CDN ever sees the student.
+
+7.2  HEAD POSE FROM THE TRANSFORMATION MATRIX, NOT LANDMARK RATIOS [IMPLEMENTED]
+     Most classroom-engagement work estimates orientation from ratios between
+     sparse landmarks normalised by frame size - which is SCALE-DEPENDENT: the
+     same rotation yields different angles depending on how far the subject sits
+     from the camera. Reading the rotation submatrix of MediaPipe's facial
+     transformation matrix removes the distance dependence entirely.
+
+7.3  GAZE MEASURED INDEPENDENTLY OF HEAD POSE               [IMPLEMENTED]
+     Blendshape eye-look activations give a gaze signal orthogonal to yaw. This
+     detects the specific cheating posture that head-pose-only systems are blind
+     to: HEAD SQUARE TO THE SCREEN, EYES ON A SECOND MONITOR.
+
+7.4  "UNMEASURED" AS A FIRST-CLASS STATE          [IMPLEMENTED, with one gap]
+     A faulty sensor produces an absence, not a false presence. When the model or
+     camera is unavailable the component reports it and POSTS NOTHING.
+     Engagement components with no data are dropped and the remaining weights
+     renormalised rather than substituting a default. Attendance defaults to 100
+     so missing data cannot manufacture risk.
+     GAP: multiple faces currently yields a score of 15 rather than no score -
+     see Section 16.11.
+
+7.5  THE CLIENT IS NEVER THE SOURCE OF ITS OWN INTEGRITY CHECK  [IMPLEMENTED]
+     A consistent, deliberately applied principle:
+       - attention readings are attributed to the AUTHENTICATED CALLER, never to
+         a studentId in the request body
+       - exam mean attention is computed from rows THE SERVER RECORDED,
+         discarding any value the client sends
+       - tab-switch and focus-strike counts live on the server, so a client that
+         declines to report cannot wind them back
+       - the answer key is structurally absent from the candidate's DTO - not
+         hidden by the UI, absent from the type
+     This is the difference between a demo and a system that survives a student
+     opening DevTools.
+
+7.6  EVIDENCE-CARRYING, TRANSITION-ONLY PEDAGOGICAL STATES (ALSE) [IMPLEMENTED]
+     Raw attention percentages are not actionable for a teacher. ALSE maps each
+     reading to one of six PEDAGOGICAL states, stores only transitions with the
+     evidence sentence that caused them, and attaches a confidence that honestly
+     degrades toward 60 for ambiguous readings. The result is a readable timeline
+     instead of a wall of numbers.
+
+7.7  EXPLAINABLE ENGAGEMENT                                 [IMPLEMENTED]
+     The score is never a bare number: it decomposes into seven weighted factors
+     with their individual contributions, and the system names the two weakest as
+     the improvement area. The "why" ships next to the "what".
+
+7.8  CLOSED-LOOP INTERVENTIONS WITH MEASURED OUTCOMES       [IMPLEMENTED]
+     Most systems stop at a dashboard. Here a high-risk student generates a
+     concrete action with evidence, a recommendation, an objective and a CAPTURED
+     BASELINE; after approval the outcome is measured against that baseline, and
+     the success rate feeds back into the digital twin. The 7-day cooldown stops
+     the queue thrashing.
+
+7.9  HONEST ENFORCEMENT SCOPE                               [IMPLEMENTED]
+     The product states in its own UI what a browser cannot do: it cannot see
+     which application a student switched to, and cannot close it. Enforcement is
+     scoped to blocking our own room, reporting, and removal. A screen share is
+     rejected unless displaySurface === 'monitor', because a single-tab share
+     would defeat the point. Removal survives a reload. Readmission FORGIVES
+     without ERASING - the strikes stop counting but the session report still
+     records what happened and who forgave it.
+
+7.10 ONE UNIFIED RECORD                                     [IMPLEMENTED]
+     Course management, live classrooms, proctored exams, assignments,
+     attendance, co-curricular credits and guardian access in one system, where
+     engagement measurement feeds the same analytics that drive grading and risk.
+     The usual alternative is four disconnected tools and a fragmented record.
+
+7.11 IDENTITY VERIFICATION VIA FACE EMBEDDINGS   [PAPER ONLY - NOT IMPLEMENTED]
+7.12 LEARNED MLP ATTENTION CLASSIFIER IN ONNX    [PAPER ONLY - NOT IMPLEMENTED]
+     See Section 16. These are the paper's two headline novelty claims and
+     neither exists in this repository yet. They are the top of Section 18.
+
+
+================================================================================
+8. PRIVACY AND RESPONSIBLE-AI DESIGN
+================================================================================
+
+  - NO IMAGE OR VIDEO EVER LEAVES THE DEVICE during normal monitoring. Frames
+    are processed and discarded in the browser.
+  - The camera never opens without an explicit click. Consent is revocable with
+    a single control at any time.
+  - The model (3.7 MB) and the WASM runtime are served from the app's own origin
+    - no CDN, no third-party request, and it works offline.
+  - Only four derived scalars are transmitted per reading.
+  - Readings are posted on a fixed cadence, not per frame, which limits both the
+    resolution of the stored record and the database write load.
+  - When measurement fails, nothing is posted. No invented scores.
+  - The product ships a "Responsible AI & Privacy Center" page stating the
+    human-in-the-loop principle, explicit consent and local processing, and the
+    ethics pillars.
+  - HUMAN IN THE LOOP: interventions are RECOMMENDED and must be approved by a
+    teacher. A flagged exam is flagged for MANUAL INVESTIGATION, not concluded
+    as dishonesty. Readmission is a one-click teacher action.
+  - Snapshots are the one exception to "nothing leaves the device" - they are
+    captured only on an integrity event. (Currently unverified; see Section 17.)
+
+
+================================================================================
+9. SECURITY MODEL
+================================================================================
+
+  - JWT bearer authentication; BCrypt password hashing; configurable secret and
+    token lifetime; CORS restricted to configured origins
+  - 401 for anonymous, 403 for authenticated-but-wrong-role
+  - Identity always from the security context, never from the request body
+  - A student cannot read a peer's record by passing ?studentId=
+  - A guardian cannot reach past their own linked child
+  - Teachers are scoped to courses they own - grading, rosters, session actions
+  - Exam attempt ownership is verified on EVERY attempt operation
+  - The answer key is structurally absent from the candidate DTO; the endpoint
+    carrying it is staff-only
+  - Server-authoritative counters (tab switches, focus strikes) and
+    server-authoritative clocks (exam countdown)
+  - SecurityBoundaryTest runs the REAL filter chain with REAL tokens against an
+    in-memory database, with seeding disabled, asserting all of the above
+
+
+================================================================================
+10. DATA MODEL
+================================================================================
+
+Entities (lms-backend/src/main/java/com/lms/model):
+
+  User (Role: STUDENT, TEACHER, PARENT, ADMIN), Department
+  Course, Enrollment
+  Assignment, Submission (Status: PENDING, IN_PROGRESS, SUBMITTED, GRADED)
+  Exam, Question (QuestionType: MCQ, ...), ExamAttempt
+      (AttemptStatus: IN_PROGRESS, SUBMITTED, AUTO_SUBMITTED_VIOLATION, ...),
+      Answer
+  AttendanceRecord
+  ClassroomSession, ChatMessage
+  AttentionLog        (score, faceDetected, faceCount, eyeStatus, isTabActive,
+                       sessionId, contextType, timestamp)
+  Alert               (AlertType: NO_FACE, MULTIPLE_FACES, LOOKING_AWAY,
+                       TAB_SWITCH, LOW_ATTENTION, OFF_TASK;
+                       Severity: LOW, MEDIUM, HIGH, CRITICAL)
+  ProctoringSnapshot
+  LearningStateLog    (LearningState: FOCUSED, DEEP_LEARNING, COLLABORATIVE,
+                       PASSIVE_LEARNING, DISTRACTED, STRUGGLING)
+  Intervention        (Status: PENDING, APPROVED, REJECTED)
+  CampusEvent, Notification, CreditActivity, ResumeAnalysis
+
+Remember the ddl-auto=update enum CHECK-constraint trap in Section 3 whenever
+you add a constant to any of these enums.
+
+
+================================================================================
+11. API SURFACE
+================================================================================
+
+Auth         POST /api/auth/login, /register       GET /api/auth/me
+Public       GET  /api/public/stats
+Dashboards   GET  /api/dashboard/{student,teacher,parent,admin}
+             GET  /api/dashboard/engagement-breakdown
+Analytics    GET  /api/analytics/{weekly,monthly,departments,roster}
+Courses      GET  /api/courses/my, /{id}
+             POST /api/courses, /{id}/enroll
+Assignments  GET  /api/assignments/my
+             POST /api/assignments, /{id}/start, /{id}/submit
+Grading      GET  /api/assignments/submissions
+             POST /api/assignments/submissions/{id}/grade
+Exams        GET  /api/exams/{id}/paper        (NO answer key)
+             GET  /api/exams/{id}/my-attempt, /attempts/{id},
+                  /attempts/{id}/result
+             POST /api/exams/{id}/start, /attempts/{id}/answer,
+                  /attempts/{id}/tab-switch, /submit
+ALSE         GET  /api/alse/{learning-state,digital-twin,interventions,simulator}
+             POST /api/alse/interventions/{id}/{approve,reject}
+Classroom    GET  /api/classroom/{live,report}
+             GET/POST /api/classroom/{id}/chat
+             POST /api/classroom/{id}/focus-event
+             GET  /api/classroom/{id}/my-standing
+             GET  /api/classroom/{id}/standings           (host teacher only)
+             POST /api/classroom/{id}/readmit/{studentId} (host teacher only)
+Campus       GET  /api/events, /notifications, /credits/my, /exams/my-exams
+Monitoring   POST /api/monitoring/attention   (attributed to the caller)
+             GET  /api/monitoring/alerts/all, /alerts/{sessionId},
+                  /logs/{sessionId}                        (staff only)
+AI           POST /api/ai/copilot/ask
+             GET  /api/ai/predict-risk/{id}, /exam-integrity/{id}
+Resume       POST /api/resume/analyze          GET /api/resume/latest
+
+
+================================================================================
+12. REALTIME (STOMP over SockJS at /ws)
+================================================================================
+
+  /topic/alerts/all                        every proctoring alert, platform-wide
+  /topic/alerts/{context}/{sessionId}      alerts scoped to one session
+  /topic/monitoring/{context}/{sessionId}  attention updates
+  /topic/chat/{sessionId}                  classroom chat
+  /topic/notifications/{userId}            that user's notifications
+  /topic/classroom/{sessionId}             WebRTC signalling, hand raise,
+                                           reactions, readmission events
+
+Inbound mapping: /signal/{sessionId} broadcasts offers, answers and ICE
+candidates to every subscriber of that session.
+
+NOTE: the signalling plumbing exists; the peer media path does not. See
+Sections 16 and 17.
+
+
+================================================================================
+13. SEED DATA
+================================================================================
+
+DataInitializer generates a self-consistent 8-week term from a FIXED RANDOM
+SEED, so the demo is identical on every fresh database:
+
+  6 departments
+  6 teachers, 12 students (each with a behaviour profile from excellent to
+    at-risk), 1 guardian linked to a student, 1 admin
+  6 courses with enrolments
+  8 assignments with per-student submissions and grades
+  ~570 attendance records across the term
+  2 proctored exams:
+      an ML midterm every student has already sat, so the analytics have history
+      an un-attempted Data Structures class test, so the exam flow can be
+        demonstrated live
+  3 classroom sessions (one live) with chat history
+  ~400 attention readings over the last 7 days, and the alerts they trigger
+  Campus events, notifications, co-curricular credit activities
+
+Because the behaviour profiles drive every signal, the derived dashboards, risk
+bands and learning states all AGREE WITH EACH OTHER - an at-risk profile shows
+as at-risk everywhere.
+
+
+================================================================================
+14. TESTING
+================================================================================
+
+  cd lms-backend  && mvn test           # 151 tests
+  cd lms-frontend && npm test           #  56 tests
+  cd lms-frontend && npm run test:e2e   # needs both servers running
+
+BACKEND - 124 unit + 27 integration. Unit tests mock every repository and build
+their own fixtures (src/test/java/com/lms/TestFixtures.java), so they never
+depend on the demonstration seed.
+
+  AnalyticsServiceTest        engagement weight renormalisation when components
+                              have no data; the 15-point alert-penalty cap; GPA
+                              mapping; risk-band boundaries at 60/75/85; every
+                              letter-grade boundary; course-progress blending
+  ExamServiceTest             that the paper DTO cannot carry an answer key;
+                              attempt ownership on every operation;
+                              resume-not-restart; one sitting per candidate;
+                              server-side tab-switch termination; MCQ and
+                              written marking; submission idempotency
+  AlseServiceTest             all ten classification branches; transition-only
+                              recording; the watermark; the seven-factor
+                              explainable score; the intervention cooldown;
+                              live outcome measurement
+  AcademicServiceGradingTest  grading scoped to the course owner; mark bounds;
+                              notification on grade; assignment-creation
+                              validation
+  ResumeServiceTest           a strong resume outscores a weak one; scoring is
+                              deterministic
+  SecurityBoundaryTest        the real filter chain with real tokens against an
+                              in-memory DB (seeding off via
+                              lms.seed.enabled=false in
+                              application-test.properties): 401 anonymous, 403
+                              wrong role, no peer access via ?studentId=, no
+                              guardian access past their own child
+
+FRONTEND - 56 tests (Vitest + Testing Library):
+  the useApi contract every page depends on
+  CoursesPage in all four states (loading, populated, empty, error-with-retry)
+  39 tests over faceScoring.js: eye aspect ratio, Euler extraction from the
+    transformation matrix, the eye-status decision ORDER, attention penalties
+    and their caps, and the smoothing window.
+  Those are pure functions precisely so they can be tested without a browser, a
+  camera or a WebGL context.
+
+E2E - drives a real browser through all four role logins using a browser already
+installed on the machine; no browser download.
+
+NOT COVERED (stated honestly):
+  Controllers are exercised only through SecurityBoundaryTest; there are no
+  per-endpoint response-shape tests. ClassroomInsightService, DashboardService
+  and the WebSocket paths have no unit tests. On the frontend only CoursesPage
+  has component tests. ProctoringCamera has no component test - its behaviour is
+  camera- and WebGL-bound.
+
+
+================================================================================
+15. CONFIGURATION
+================================================================================
+
+Everything has a working default; override via environment variables.
+
+  DB_URL                  file-backed H2 in ./data  Point at MySQL to leave H2
+  APP_JWT_SECRET          dev literal in application.properties
+                          ** SET THIS BEFORE DEPLOYING ANYWHERE REAL **
+  APP_JWT_EXPIRATION_MS   86400000                  Token lifetime (24 hours)
+  APP_CORS_ORIGINS        localhost:5173,4173       Allowed browser origins
+  lms.seed.enabled        true                      false skips the demo seed
+  lms.upload.dir          uploads/snapshots/        Snapshot storage
+  VITE_API_BASE_URL       http://localhost:8080/api Frontend API base
+  VITE_WS_URL             http://localhost:8080/ws  Frontend WebSocket base
+
+
+================================================================================
+16. PAPER vs CODE - CLAIMS NOT BACKED BY THE IMPLEMENTATION
+================================================================================
+
+*** READ THIS BEFORE SUBMITTING paper/main.tex OR DEMONSTRATING THE SYSTEM. ***
+
+The paper describes a system that is in several respects NOT the system in this
+repository. Every item below was verified against the source. Each one is either
+something to BUILD (Section 18) or something to CORRECT IN THE PAPER.
+
+16.1  FACE VERIFICATION / IDENTITY CHECKING - DOES NOT EXIST
+      The paper's abstract, contribution list, Section IV-E "Identity
+      Verification", and Table II ("Identity Verification Performance", with
+      mean genuine distance 0.34, mean impostor distance 0.82, FAR 5.0%, FRR
+      4.0%) all describe a 128-dimensional face descriptor network compared by
+      Euclidean distance against an enrolled reference at a threshold of 0.6.
+      NONE OF THIS IS IN THE CODE. There is no embedding network, no enrolment
+      flow, no descriptor storage, no distance comparison, and no face-api or
+      FaceNet dependency. A grep for "descriptor", "embedding" and "euclidean"
+      across both source trees returns only the MediaPipe vendor bundles.
+      The paper also cites Schroff et al. (FaceNet) for this.
+
+16.2  LEARNED MLP ATTENTION CLASSIFIER / ONNX RUNTIME - DOES NOT EXIST
+      The paper's Section IV-C describes a 15-dimensional feature vector, a
+      multilayer perceptron with hidden widths 32 and 16, ReLU activations,
+      dropout, class weights, four output classes (attentive / looking away /
+      looking down / drowsy), exported to an interchange format and run in the
+      browser. Table I lists "Classifier runtime: ONNX Runtime Web". Table III
+      reports per-class precision/recall/F1 for it.
+      NONE OF THIS IS IN THE CODE. onnxruntime-web is not in package.json, there
+      is no .onnx file anywhere, and there is no feature extractor. The only
+      attention classification that exists is the RULE-BASED score in
+      faceScoring.js (Section 6.14) plus the ALSE state rules (Section 6.16).
+
+16.3  SAMPLING RATE
+      The paper states 0.5 Hz "chosen based on database write load
+      considerations". The code posts every 5000 ms - that is 0.2 Hz.
+      (reportEveryMs = 5000 in ProctoringCamera.jsx, and both call sites in
+      ExamTakingPage.jsx and OnlineClassroom.jsx pass 5000.)
+      The paper's supporting anecdote about a "600 ms interval" producing "one
+      hundred rows per minute" is consistent with a real tuning decision, but
+      the final figure printed is wrong.
+
+16.4  HEAD POSE EQUATION DOES NOT MATCH THE CODE
+      Paper equation (1):
+          pitch = arcsin(-r12)
+          yaw   = arctan2(r02, r22)
+          roll  = arctan2(r10, r11)
+      Actual code (faceScoring.js, column-major indexing):
+          pitch = atan2(r21, r22)
+          yaw   = atan2(-r20, hypot(r21, r22))
+          roll  = atan2(r10, r00)
+      These are different Tait-Bryan conventions with different element
+      selections. The code's version is the standard XYZ extraction and is
+      unit-tested; the paper's is not what runs. Fix the paper to match, or
+      state the convention precisely.
+
+16.5  GAZE EQUATION DOES NOT MATCH THE CODE
+      Paper equation (3) averages across both eyes:
+          g_x = (b_inL + b_outR)/2  -  (b_outL + b_inR)/2
+      and explicitly argues "averaging across both eyes is more stable than
+      relying on either alone, since one eye becomes partially occluded as the
+      head rotates."
+      The code takes a MAXIMUM, not a mean, and produces an unsigned magnitude
+      in 0..1 rather than a signed deviation:
+          left  = max(eyeLookOutLeft,  eyeLookInRight)
+          right = max(eyeLookOutRight, eyeLookInLeft)
+          gaze  = min(1, max(left, right))
+      The paper's stated justification therefore describes behaviour the system
+      does not have. Note the code's choice is defensible for a different
+      reason - a max is robust exactly when one eye IS occluded - but that is
+      not the argument the paper makes.
+
+16.6  ATTENTION SCORE EQUATION DOES NOT MATCH THE CODE
+      Paper equation (5):
+          S = 100 - min(35, 0.9|yaw|) - min(20, 0.5|pitch|)
+                  - min(10, 0.3|roll|) - 30c
+      Actual code:
+          S = 100 - min(30, 1.2|yaw|) - min(20, 1.0|pitch|)
+                  - min(15, 0.6|roll|) - min(20, 25*gaze)
+              then -30 EYES_CLOSED / -25 LOOKING_AWAY / -10 LOOKING_DOWN
+      Every coefficient and cap differs, and the code has a gaze term the paper's
+      equation omits entirely. The paper's smoothing parameter (alpha = 0.35) IS
+      correct and does match createSmoother.
+
+16.7  EYE CLOSURE METHOD IS DESCRIBED AS EXCLUSIVE, BUT THE CODE IS A HYBRID
+      The paper's Section IV-A-3 says closure is taken from the learned per-eye
+      blendshape coefficient "rather than from the eye aspect ratio, avoiding
+      the person specific threshold that the geometric formulation requires."
+      The code computes BOTH and cross-checks them (eyesClosedEar = 0.18 and
+      eyesClosedBlendshape = 0.5), and the README describes it correctly as a
+      cross-check. The hybrid is arguably the better design - but the paper
+      claims the opposite of what is implemented, and the person-specific
+      threshold it says it avoids is still present as the EAR constant.
+
+16.8  WEBRTC PEER-TO-PEER MEDIA - SIGNALLING ONLY
+      The paper's architecture figure, Section III-C, Table I ("Media transport:
+      WebRTC, full mesh") and the mesh-topology limitation all describe live
+      peer-to-peer media.
+      What exists: the STOMP signalling controller (SignalingController
+      broadcasting offers/answers/ICE on /topic/classroom/{id}) and the
+      simple-peer dependency in package.json. What does not exist: any use of
+      simple-peer, any RTCPeerConnection, any getUserMedia-to-peer path.
+      OnlineClassroom.jsx contains no peer code. The README states this honestly;
+      the paper does not.
+
+16.9  ALL REPORTED RESULTS ARE UNSOURCED
+      Tables II, III and IV print specific figures (FAR 5.0% / FRR 4.0%; macro
+      F1 0.91; head-pose MAE 4.31/4.08/3.76 degrees for the matrix method versus
+      8.42/7.85/6.73 for the ratio method) directly beneath paragraphs headed
+      "Protocol" that instruct the reader how to MEASURE those values. Nothing
+      in this repository produces any of them: there is no evaluation harness,
+      no dataset loader, no AFLW2000/300W-LP integration, and two of the three
+      systems being evaluated do not exist (16.1, 16.2).
+      Submitting these numbers as measurements would be fabrication. Either run
+      the protocols and report what you get, or remove the tables and present
+      the work as a systems contribution with a stated evaluation plan.
+
+16.10 THE RATIO-APPROXIMATION BASELINE IS NOT IMPLEMENTED EITHER
+      Paper equation (2) defines the interocular-normalised ratio method, and
+      Table IV compares it against the matrix method. The code contains no ratio
+      implementation - only the matrix method. There is nothing to compare
+      against.
+
+16.11 "NO ATTENTION SCORE WITH MULTIPLE FACES" IS NOT WHAT THE CODE DOES
+      The paper states: "With multiple faces present no attention score is
+      emitted at all, since the measurement cannot be attributed to a specific
+      individual."
+      The code returns 15 for faceCount > 1 - a low score, but a score, which
+      then flows into the mean attention that feeds the engagement blend. This
+      directly contradicts the paper's central "unmeasured is not defaulted"
+      thesis and is the one place the codebase breaks its own rule. It is a
+      small fix (return null / omit the reading) and worth making, because it is
+      the exact case the thesis is about.
+
+16.12 ATTENDANCE INFERENCE FROM ATTENTION SAMPLES IS NOT IMPLEMENTED
+      Paper Section IV-G describes marking a student present when the number of
+      measured samples in a session exceeds a threshold, with inferred marks
+      tagged by source and never silently overwriting a manual mark.
+      No such inference exists. AttendanceRecord rows are seeded or recorded
+      directly; there is no source tag, no threshold, and the /attendance
+      register page is an explicit "not built yet" placeholder.
+
+16.13 TERMINOLOGY AND MINOR MISMATCHES
+      - The paper says the model yields "a dense landmark set" per frame without
+        stating numFaces; the code caps detection at 2 faces.
+      - The paper's Fig. 1 shows a "128-d descriptor" box in the client pipeline
+        (see 16.1) and an "Aggregation / server-computed means" box that does
+        exist.
+      - Conclusion says "orientation can be retrieved from an identity
+        transformation matrix" - "identity" is wrong there; it is the facial
+        transformation matrix. An identity matrix encodes no rotation.
+      - The system is called SmartLMS in the paper and EduVerse AI everywhere
+        else.
+
+WHAT THE PAPER GETS RIGHT (verified against the code):
+      478 landmarks, the facial transformation matrix and blendshape output;
+      client-side-only inference with frames never transmitted; the four scalars
+      in the payload; model assets served from the app's own origin for offline
+      operation; EMA smoothing with alpha = 0.35; server-side aggregation that
+      discards client-sent means; alert debouncing per student/session/type;
+      the React/Spring Boot/JPA/JWT/BCrypt/STOMP stack rows of Table I; the
+      honest framing of limitations; and the entire privacy argument, which is
+      the paper's strongest and most defensible claim.
+
+
+================================================================================
+17. KNOWN LIMITATIONS, NOT BUILT, AND UNVERIFIED
+================================================================================
+
+17.1 ROUTES THAT RENDER AN HONEST PLACEHOLDER
+     /attendance    the register view (the underlying attendance data is real
+                    and does drive the dashboards)
+     /profile       profile editing
+     /settings      platform preferences
+     /admin/users   user administration
+
+17.2 CAMERA PROCTORING IS VERIFIED ONLY FOR THE NEGATIVE CASE
+     The pipeline was driven end to end against Chromium's synthetic capture
+     device, which emits a pattern containing no face: the model loads,
+     inference runs, NO_FACE readings post, and the backend raises HIGH NO_FACE
+     alerts onto the invigilator feed.
+     POSITIVE DETECTION - a real face producing landmarks, head pose and an
+     attention score - HAS NOT BEEN MACHINE-VERIFIED, because a headless browser
+     has no face to look at. Open the class test on a machine with a webcam to
+     confirm it.
+
+17.3 ALSO UNVERIFIED
+     - the landmark overlay drawing
+     - the WebRTC peer connection in the live classroom (signalling exists, the
+       media path does not)
+     - snapshot capture on violation
+
+17.4 ENFORCEMENT CANNOT CROSS THE BROWSER SANDBOX
+     A web page cannot identify which application a student switched to, and
+     cannot close it. Enforcement is limited to blocking our own room, reporting
+     to the teacher, and removing the student.
+
+17.5 NO LIVENESS DETECTION
+     Even once face verification exists (16.1), a printed photo would defeat it.
+     Blink and micro-expression checks are natural defences and are not
+     implemented.
+
+17.6 GAZE GRANULARITY
+     The blendshape gaze signal gives direction, not screen coordinates. It can
+     tell you the subject is looking away; it cannot tell you where on the screen
+     they are looking.
+
+17.7 MESH TOPOLOGY (once media exists)
+     Full-mesh peer connections scale with the square of the participant count;
+     viable to roughly ten concurrent participants before a selective forwarding
+     unit is required.
+
+17.8 CONNECTIVITY
+     Only public STUN servers are contemplated. Peers behind restrictive NATs
+     will fail to connect without a TURN relay.
+
+17.9 POPULATION
+     Any evaluation here would rest on a small sample from a single institution,
+     with untested variation in demographics, eyewear and illumination. Results
+     should not be extrapolated.
+
+17.10 DATABASE
+     H2 file-backed by default with ddl-auto=update and the enum CHECK-constraint
+     trap (Section 3). Not a production posture.
+
+17.11 THE "AI" IS RULE-BASED
+     The copilot is keyword routing over the student's own record; the risk
+     model is an EMA plus weighted counters; the integrity model is a weighted
+     penalty sum. These are transparent and debuggable, which is a genuine
+     virtue - but nothing here is a trained model, and the naming ("AI
+     Intelligence", "predict-risk") oversells it. The only neural network in the
+     system is MediaPipe's, which is pre-trained and used as-is.
+
+
+================================================================================
+18. YET TO IMPLEMENT - FULL ROADMAP
+================================================================================
+
+Grouped by priority. Tier A is what the paper already claims; until it is built,
+the paper cannot be submitted as written.
+
+--------------------------------------------------------------------------------
+TIER A - REQUIRED TO MAKE THE PAPER TRUE
+--------------------------------------------------------------------------------
+
+A1. FACE VERIFICATION / IDENTITY PROCTORING  (paper 16.1)
+    - Choose an embedding network runnable in the browser. Options: face-api.js
+      (128-d, FaceNet-style, easy, unmaintained), or a MobileFaceNet / ArcFace
+      ONNX model via onnxruntime-web (better accuracy, more work).
+    - ENROLMENT FLOW: capture N frames at registration, compute a descriptor per
+      frame, AVERAGE them so the reference does not encode one pose or one
+      lighting condition. Store the averaged vector against the user.
+    - VERIFICATION AT EXAM START and periodically during the attempt: compute
+      the live descriptor, take the Euclidean distance to the reference, declare
+      a match when d < tau (start at tau = 0.6 and TUNE IT ON YOUR OWN DATA -
+      do not inherit the constant).
+    - EXPOSE THE MARGIN (tau - d), not just the boolean. Decisions near the
+      threshold are not diagnostic of either class, and the invigilator should
+      see that.
+    - A mismatch FLAGS FOR MANUAL REVIEW. It must never auto-conclude dishonesty.
+    - Keep the descriptor on the device if at all possible; if the reference
+      must be stored server-side, store the vector only, never the image, and
+      document the retention policy.
+    - Decide and document whether a face embedding counts as biometric data
+      under your institution's policy and under India's DPDP Act. This is the
+      single biggest privacy escalation in the roadmap: today the system stores
+      no biometric identifier at all, and this feature changes that.
+
+A2. LEARNED ATTENTION CLASSIFIER  (paper 16.2)
+    - Build the 15-feature extractor the paper describes: orientation ratios,
+      per-eye closure and asymmetry, mouth aspect ratio, facial scale, frame
+      position in the cascade, detection confidence - each normalised by
+      interocular distance or frame dimension for invariance to distance and
+      resolution.
+    - CRITICAL: use THE SAME CODE PATH for feature extraction during dataset
+      capture and during inference. If they diverge, your reported accuracy will
+      not reflect production behaviour. Put it in faceScoring.js next to the
+      existing pure functions so it is unit-testable.
+    - Build a capture tool: label frames as attentive / looking away / looking
+      down / drowsy, target ~500 per class per subject, at least 4-5 subjects.
+    - Train an MLP (hidden 32, 16; ReLU; dropout; class weights for imbalance).
+      Export to ONNX. Add onnxruntime-web and serve the model from public/ like
+      the MediaPipe assets, so the offline guarantee holds.
+    - PARTITION BY SUBJECT, NEVER BY SAMPLE. Consecutive frames are near
+      duplicates; a random sample split will report an accuracy that collapses
+      on an unseen person.
+    - Keep the rule-based score as the documented fallback when the model fails
+      to load - which is already the right architecture, so this slots in.
+    - Report the AGREEMENT between the learned classifier and the rule score,
+      and characterise the disagreements: that is where the hand-chosen weights
+      are wrong, and it is a genuinely interesting result.
+
+A3. RUN THE THREE EVALUATION PROTOCOLS  (paper 16.9)
+    - Identity: N >= 5 enrolled subjects, N genuine and N(N-1) impostor
+      comparisons, report both distributions plus FAR and FRR at your tuned tau.
+    - Attention: subject-held-out precision/recall/F1 per class plus macro
+      average.
+    - Head pose: evaluate against an annotated corpus (the paper cites Zhu et
+      al. 2016, i.e. 300W-LP / AFLW2000) and report per-axis MAE.
+    - Runtime: median inference latency per frame and CPU utilisation on
+      commodity student hardware, with and without GPU delegate. You already
+      have the GPU/CPU fallback path, so this one is nearly free.
+    - Then replace the invented table values with what you actually measured.
+
+A4. RECONCILE EVERY EQUATION AND CONSTANT IN THE PAPER WITH THE CODE
+    Items 16.3 through 16.7. For each, decide which is correct and change the
+    other. Do not leave a paper equation that no code implements.
+
+A5. IMPLEMENT THE RATIO BASELINE  (paper 16.10)
+    Needed only if you want Table IV's comparison. It is maybe 30 lines next to
+    eulerFromMatrix, and it is the cleanest way to demonstrate the
+    scale-independence argument that is one of the paper's real contributions.
+
+A6. WEBRTC MEDIA PATH  (paper 16.8)
+    simple-peer is already a dependency and the signalling topic already carries
+    offers, answers and ICE candidates. Wire getUserMedia to a peer per remote
+    participant, attach remote streams to video elements, and handle
+    join/leave/renegotiation. Until this exists the "live classroom" has chat,
+    monitoring and enforcement but no video.
+
+A7. FIX "MULTIPLE FACES" TO EMIT NO SCORE  (paper 16.11)
+    Return null / omit the reading rather than 15, and make the server, the
+    engagement mean and the UI all handle an explicitly absent score. Small
+    change; it is the difference between the paper's thesis being true and being
+    nearly true.
+
+A8. ATTENDANCE INFERENCE FROM ATTENTION SAMPLES  (paper 16.12)
+    Mark present when measured samples in a session exceed a threshold; TAG THE
+    SOURCE (inferred vs manual); never let an inferred mark overwrite a manual
+    one; surface the camera-disabled ambiguity in the UI. Pair it with building
+    the /attendance register view so there is somewhere to show it.
+
+--------------------------------------------------------------------------------
+TIER B - PRODUCT GAPS
+--------------------------------------------------------------------------------
+
+B1.  /attendance register view (per-course, per-session, editable by the teacher)
+B2.  /profile - view and edit your own details, change password, manage consent
+B3.  /settings - platform preferences, notification settings, theme persistence
+B4.  /admin/users - create, deactivate, reassign roles, link guardians
+B5.  Selective Forwarding Unit for classrooms beyond ~10 participants
+B6.  TURN server configuration for restrictive NATs
+B7.  Liveness / presentation-attack detection: blink challenge, micro-motion,
+     or a randomised head-turn prompt
+B8.  Calibrated point-of-regard gaze: a short 5-9 point calibration at exam
+     start turning direction into approximate screen coordinates
+B9.  Verify and finish snapshot capture on violation, with a retention policy
+     and a student-visible record of what was captured
+B10. Verify the landmark overlay rendering
+B11. Assignment file uploads (currently text submissions)
+B12. Bulk operations for teachers: bulk grade, bulk enrol, CSV import/export
+B13. Exportable session and exam integrity reports (PDF) for records
+B14. Email / push notification delivery, not just in-app
+B15. Question bank with randomised per-candidate ordering and selection
+B16. Proper exam scheduling with time windows, late policy and extensions
+B17. Accessibility: keyboard navigation, screen-reader labels, and an explicit
+     non-visual path for any student who cannot or will not use a camera
+B18. Mobile / responsive layouts and a tablet exam mode
+
+--------------------------------------------------------------------------------
+TIER C - ENGINEERING AND PRODUCTION READINESS
+--------------------------------------------------------------------------------
+
+C1.  Move off H2 to MySQL or PostgreSQL
+C2.  Replace ddl-auto=update with Flyway or Liquibase migrations - this kills
+     the enum CHECK-constraint trap permanently
+C3.  Per-endpoint controller tests for response shapes
+C4.  Unit tests for ClassroomInsightService, DashboardService and the WebSocket
+     paths
+C5.  A component test for ProctoringCamera with a mocked MediaPipe module
+C6.  Rate limiting on auth and on POST /api/monitoring/attention
+C7.  Refresh tokens and token revocation
+C8.  Audit log for every staff action that touches a student record
+C9.  Offline queueing of attention readings with replay, so a dropped network
+     does not silently lose a monitored window
+C10. Model and threshold versioning: record which model version and which
+     constants produced each stored reading, so historical data stays
+     interpretable after a retune
+C11. A consent audit trail: when consent was given, revoked, and what was
+     collected in between
+C12. Data retention and deletion policy, with a student-facing export and
+     delete (GDPR / India DPDP)
+C13. Structured logging, metrics and health endpoints
+C14. Containerisation and a CI pipeline running both test suites
+C15. Internationalisation
+C16. Load testing the attention ingest path at realistic class sizes
+C17. Replace the dev JWT secret and document secret management
+
+--------------------------------------------------------------------------------
+TIER D - RESEARCH EXTENSIONS
+--------------------------------------------------------------------------------
+
+D1.  FAIRNESS AND BIAS EVALUATION across skin tone, eyewear, facial hair, head
+     covering and illumination. This is the most important item in Tier D and
+     arguably belongs in Tier A: a system that under-detects faces for some
+     students will systematically mark them absent or inattentive. MediaPipe's
+     own model card is a starting point, but you must measure on your own
+     population. Any deployment without this is indefensible.
+D2.  Temporal modelling over the state sequence (LSTM / TCN / HMM) instead of
+     per-frame classification plus smoothing - attention is inherently temporal
+     and the transition structure is already being stored
+D3.  Multimodal fusion: add audio (speech presence, prosody) and interaction
+     traces (scroll, keystroke cadence) to the vision signal
+D4.  Per-subject calibration: a short neutral-pose capture to personalise the
+     EAR threshold and the resting pitch offset, removing two of the remaining
+     person-specific constants
+D5.  Federated or on-device learning so the classifier improves without
+     centralising any student data - a natural extension of the privacy thesis
+D6.  Cohort-level anomaly detection: flag a whole class losing attention at the
+     same moment, which is a signal about the TEACHING, not the students
+D7.  Proper A/B measurement of intervention efficacy, with control groups, so
+     the intervention success rate becomes a causal claim rather than a
+     correlation
+D8.  Predictive dropout and outcome modelling over a full term of real data
+D9.  Validate the six ALSE states against an external construct - expert human
+     annotation, or a published corpus such as DAiSEE - so the state labels
+     carry evidence rather than being defined by the thresholds that produce them
+D10. Publish the labelled dataset and the capture tool, if consent allows
+
+
+================================================================================
+19. FILE MAP
+================================================================================
+
+lms-backend/src/main/java/com/lms/
+  config/       DataInitializer (seed), SecurityConfig, WebSocketConfig,
+                GlobalExceptionHandler
+  controller/   Auth, Course, Assignment, Exam, Classroom, Monitoring, Alse,
+                Analytics, Dashboard, Campus, Resume, AiIntelligence, Public,
+                Signaling
+  service/      AnalyticsService      <- the single source of truth for figures
+                AlseService           <- learning states, twin, interventions,
+                                         simulator
+                ExamService           <- attempts, answer-key isolation,
+                                         tab-switch enforcement
+                ClassroomService      <- sessions, chat, focus strikes,
+                                         readmission
+                MonitoringService     <- attention ingest, alert rules,
+                                         snapshots
+                AiIntelligenceService <- risk, exam integrity, copilot
+                AcademicService, AuthService, CourseService, DashboardService,
+                ClassroomInsightService, NotificationService, ResumeService
+  model/        JPA entities (Section 10)
+  repository/   Spring Data repositories
+  security/     JwtTokenProvider, JwtAuthenticationFilter, UserPrincipal,
+                CustomUserDetailsService, CurrentUser
+  dto/          Request/response shapes - note ExamDtos.PaperQuestion has no
+                correctAnswer field, by design
+
+lms-backend/src/test/java/com/lms/
+  TestFixtures.java, service/*Test.java, security/SecurityBoundaryTest.java
+
+lms-frontend/src/
+  utils/faceScoring.js        <- ALL the vision maths, pure and unit-tested
+  utils/faceDetection.js      <- MediaPipe wiring, GPU/CPU fallback
+  components/proctoring/ProctoringCamera.jsx
+  components/classroom/       ClassroomLobby, FocusStandings, OffTaskOverlay
+  hooks/                      useApi, useClassGuard, useRealtime, useLiveAlerts
+  pages/                      4 dashboards + Courses, Assignments, Grading,
+                              Exams, ExamTaking, OnlineClassroom,
+                              AdaptiveLearningState, DigitalTwin,
+                              LearningSimulator, AIInterventionCenter,
+                              AIMonitoring, AIReports, AIAssistant,
+                              EngagementAnalytics, ResponsibleAICenter,
+                              ResumeScoring, AcademicCredits, Events,
+                              Notifications, Architecture, Landing, Login,
+                              Placeholder
+  services/                   api.js (axios), websocket.js (STOMP)
+
+lms-frontend/public/
+  models/face_landmarker.task     3.7 MB, served from own origin
+  mediapipe/wasm/                 SIMD and non-SIMD runtimes
+
+paper/main.tex                    IEEE conference paper - SEE SECTION 16
+README.md                         operational readme
+PROJECT_OVERVIEW.txt              this file
+
+================================================================================
+END
+================================================================================

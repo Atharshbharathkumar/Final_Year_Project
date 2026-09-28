@@ -16,4 +16,10 @@ public class UserDto {
     private String fullName;
     private User.Role role;
     private String avatarUrl;
+    private String avatarEmoji;
+    private String department;
+    private Integer studyYear;
+    /** Populated for guardian accounts so the UI knows whose data it is showing. */
+    private Long linkedStudentId;
+    private String linkedStudentName;
 }

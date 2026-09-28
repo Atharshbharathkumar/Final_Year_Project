@@ -15,7 +15,5 @@ public class ExamSubmissionDto {
     private Long attemptId;
     private Map<Long, String> answers; // QuestionId -> SelectedOption/AnswerText
     private Integer tabSwitchCount;
-    // averageAttentionScore was removed: it is now computed server-side from the
-    // recorded attention logs in ExamService.submitExamAttempt. Accepting it from
-    // the client let the browser being proctored report its own integrity score.
+    private Double averageAttentionScore;
 }

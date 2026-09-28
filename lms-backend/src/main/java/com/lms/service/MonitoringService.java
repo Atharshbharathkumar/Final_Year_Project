@@ -15,13 +15,10 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.Base64;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Service
@@ -39,25 +36,15 @@ public class MonitoringService {
     private String uploadDir;
 
     /**
-     * Cooldown between two alerts of the same type for the same student in the
-     * same session. Without this, a student looking away for 30s produced one
-     * Alert row and one broadcast per sample tick.
-     */
-    private static final Duration ALERT_COOLDOWN = Duration.ofSeconds(60);
-    private final Map<String, LocalDateTime> lastAlertAt = new ConcurrentHashMap<>();
-
-    /**
-     * @param studentEmail the authenticated principal. The student is resolved
-     *                     from the session, never from the request body, so a
-     *                     caller cannot log telemetry against another student.
+     * Records one attention reading against the authenticated caller.
+     * <p>
+     * The student is taken from the security context, never from the payload:
+     * a candidate must not be able to post telemetry in someone else's name,
+     * either to inflate their own record or to damage a peer's.
      */
     @Transactional
-    public AttentionLog recordAttention(AttentionPayloadDto dto, String studentEmail) {
-        User student = userRepository.findByEmail(studentEmail)
-                .orElse(null);
-
+    public AttentionLog recordAttention(AttentionPayloadDto dto, User student) {
         if (student == null) return null;
-
         dto.setStudentId(student.getId());
         dto.setStudentName(student.getFullName());
 
@@ -89,8 +76,6 @@ public class MonitoringService {
         Alert.Severity severity = Alert.Severity.MEDIUM;
         String message = null;
 
-        // Null vision fields mean "not measured" (degraded engine, or a tab-switch
-        // event carrying no frame). Only an explicit FALSE is evidence of absence.
         if (Boolean.FALSE.equals(dto.getFaceDetected())) {
             alertType = Alert.AlertType.NO_FACE;
             severity = Alert.Severity.HIGH;
@@ -109,7 +94,7 @@ public class MonitoringService {
             message = "Student " + student.getFullName() + " switched tab / window!";
         }
 
-        if (alertType != null && !isWithinCooldown(student, dto, alertType)) {
+        if (alertType != null) {
             Alert alert = Alert.builder()
                     .student(student)
                     .sessionId(dto.getSessionId())
@@ -134,40 +119,58 @@ public class MonitoringService {
                     .timestamp(alert.getTimestamp())
                     .build();
 
-            // Broadcast alert over STOMP WebSocket topic
+            // Broadcast to the session room, and to the platform-wide feed the
+            // teacher and admin dashboards subscribe to.
             messagingTemplate.convertAndSend("/topic/alerts/" + dto.getContextType() + "/" + dto.getSessionId(), alertDto);
+            messagingTemplate.convertAndSend("/topic/alerts/all", alertDto);
         }
     }
 
-    /**
-     * True when an alert of this type was already raised for this student in this
-     * session inside the cooldown window. A sustained condition should produce one
-     * alert, not one per sample.
-     */
-    private boolean isWithinCooldown(User student, AttentionPayloadDto dto, Alert.AlertType type) {
-        String key = student.getId() + "|" + dto.getContextType() + "|" + dto.getSessionId() + "|" + type;
-        LocalDateTime now = LocalDateTime.now();
-        LocalDateTime previous = lastAlertAt.get(key);
+    /** Raises a proctoring alert against an exam attempt. */
+    @Transactional
+    public Alert raiseExamAlert(User student, Long attemptId, Alert.AlertType type,
+                                Alert.Severity severity, String message) {
+        return raiseAlert(student, attemptId, "EXAM", type, severity, message);
+    }
 
-        if (previous != null && previous.isAfter(now.minus(ALERT_COOLDOWN))) {
-            return true;
-        }
-        lastAlertAt.put(key, now);
-        return false;
+    /** Raises an alert against a live classroom session. */
+    @Transactional
+    public Alert raiseClassroomAlert(User student, Long sessionId, Alert.AlertType type,
+                                     Alert.Severity severity, String message) {
+        return raiseAlert(student, sessionId, "CLASSROOM", type, severity, message);
     }
 
     /**
-     * Server-computed mean attention for a student in a session. Used instead of a
-     * client-supplied figure so the exam integrity record cannot be set by the
-     * browser being audited.
+     * Stores an alert and pushes it to both the room feed and the platform-wide
+     * invigilator feed, so an open dashboard sees it without polling.
      */
-    public Double averageAttentionFor(User student, Long sessionId, String contextType) {
-        return attentionLogRepository.averageScoreFor(student, sessionId, contextType);
-    }
+    private Alert raiseAlert(User student, Long sessionId, String contextType,
+                             Alert.AlertType type, Alert.Severity severity, String message) {
+        Alert alert = alertRepository.save(Alert.builder()
+                .student(student)
+                .sessionId(sessionId)
+                .contextType(contextType)
+                .alertType(type)
+                .severity(severity)
+                .message(message)
+                .timestamp(LocalDateTime.now())
+                .build());
 
-    public long measuredSampleCount(User student, Long sessionId, String contextType) {
-        return attentionLogRepository.countByStudentAndSessionIdAndContextTypeAndScoreIsNotNull(
-                student, sessionId, contextType);
+        AlertDto dto = AlertDto.builder()
+                .id(alert.getId())
+                .studentId(student.getId())
+                .studentName(student.getFullName())
+                .sessionId(sessionId)
+                .contextType(contextType)
+                .alertType(type)
+                .severity(severity)
+                .message(message)
+                .timestamp(alert.getTimestamp())
+                .build();
+
+        messagingTemplate.convertAndSend("/topic/alerts/" + contextType + "/" + sessionId, dto);
+        messagingTemplate.convertAndSend("/topic/alerts/all", dto);
+        return alert;
     }
 
     @Transactional

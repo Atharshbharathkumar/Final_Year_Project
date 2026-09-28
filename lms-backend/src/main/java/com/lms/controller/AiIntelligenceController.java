@@ -1,10 +1,11 @@
 package com.lms.controller;
 
+import com.lms.security.CurrentUser;
 import com.lms.service.AiIntelligenceService;
-import com.lms.service.CourseSearchService;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
@@ -13,7 +14,7 @@ import org.springframework.web.bind.annotation.*;
 public class AiIntelligenceController {
 
     private final AiIntelligenceService aiIntelligenceService;
-    private final CourseSearchService courseSearchService;
+    private final CurrentUser currentUser;
 
     @GetMapping("/predict-risk/{studentId}")
     public ResponseEntity<AiIntelligenceService.StudentAiAnalysis> predictRisk(@PathVariable Long studentId) {
@@ -25,13 +26,12 @@ public class AiIntelligenceController {
         return ResponseEntity.ok(aiIntelligenceService.evaluateExamIntegrity(attemptId));
     }
 
-    /**
-     * Searches the course material in this system. Returns matched excerpts with
-     * their source, or an explicit no-match. It does not generate text.
-     */
+    /** Study assistant grounded in the caller's own academic record. */
     @PostMapping("/copilot/ask")
-    public ResponseEntity<CourseSearchService.SearchAnswer> askCopilot(@RequestBody CopilotRequest request) {
-        return ResponseEntity.ok(courseSearchService.search(request.getQuestion()));
+    public ResponseEntity<AiIntelligenceService.CopilotAnswer> askCopilot(@RequestBody CopilotRequest request,
+                                                                         Authentication authentication) {
+        return ResponseEntity.ok(aiIntelligenceService.askAiCopilot(
+                currentUser.subjectStudent(authentication), request.getQuestion()));
     }
 
     @Data
